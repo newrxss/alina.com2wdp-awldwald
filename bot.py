@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from html import escape
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -31,17 +33,38 @@ ADMIN_ID = 1541550837
 DB_FILE = "krutyashki.sqlite3"
 IMAGE_FILE = "alina.jpg"
 
+
+# =========================================================
+# LOGGING
+# =========================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 
+# =========================================================
+# ПРОВЕРКА ТОКЕНА
+# =========================================================
+
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения Railway.")
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь его в Railway → Variables."
+    )
 
 
-bot = Bot(token=BOT_TOKEN)
+# =========================================================
+# BOT
+# =========================================================
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    )
+)
+
 dp = Dispatcher(storage=MemoryStorage())
 
 
@@ -68,6 +91,10 @@ class AdminSearch(StatesGroup):
 
 class AdminBroadcast(StatesGroup):
     waiting_message = State()
+
+
+class AdminBlock(StatesGroup):
+    waiting_user_id = State()
 
 
 # =========================================================
@@ -171,6 +198,7 @@ def is_blocked(user_id: int) -> bool:
     )
 
     row = cursor.fetchone()
+
     db.close()
 
     return bool(row and row[0] == 1)
@@ -210,6 +238,7 @@ def get_all_users():
     """)
 
     rows = cursor.fetchall()
+
     db.close()
 
     return [row[0] for row in rows]
@@ -291,6 +320,7 @@ def get_application(application_id):
     """, (application_id,))
 
     row = cursor.fetchone()
+
     db.close()
 
     return row
@@ -315,6 +345,7 @@ def get_pending_applications():
     """)
 
     rows = cursor.fetchall()
+
     db.close()
 
     return rows
@@ -338,6 +369,7 @@ def get_recent_applications():
     """)
 
     rows = cursor.fetchall()
+
     db.close()
 
     return rows
@@ -356,6 +388,7 @@ def has_pending_application(user_id: int):
     """, (user_id,))
 
     row = cursor.fetchone()
+
     db.close()
 
     return row
@@ -374,6 +407,7 @@ def has_accepted_application(user_id: int):
     """, (user_id,))
 
     row = cursor.fetchone()
+
     db.close()
 
     return row
@@ -393,6 +427,7 @@ def get_last_rejected(user_id: int):
     """, (user_id,))
 
     row = cursor.fetchone()
+
     db.close()
 
     return row
@@ -428,13 +463,14 @@ def update_application(
 
 
 # =========================================================
-# CODE
+# JOIN CODE
 # =========================================================
 
 def generate_join_code():
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
     while True:
+
         part1 = "".join(
             secrets.choice(alphabet)
             for _ in range(4)
@@ -558,6 +594,18 @@ def admin_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="🚫 Заблокировать",
+                    callback_data="admin_block"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔓 Разблокировать",
+                    callback_data="admin_unblock"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📢 Рассылка",
                     callback_data="admin_broadcast"
                 )
@@ -571,7 +619,10 @@ def admin_keyboard():
 # =========================================================
 
 @dp.message(CommandStart())
-async def start_handler(message: Message, state: FSMContext):
+async def start_handler(
+    message: Message,
+    state: FSMContext
+):
     await state.clear()
 
     save_user(message)
@@ -590,6 +641,7 @@ async def start_handler(message: Message, state: FSMContext):
     )
 
     if os.path.exists(IMAGE_FILE):
+
         photo = FSInputFile(IMAGE_FILE)
 
         await message.answer_photo(
@@ -597,7 +649,9 @@ async def start_handler(message: Message, state: FSMContext):
             caption=text,
             reply_markup=main_keyboard()
         )
+
     else:
+
         await message.answer(
             text,
             reply_markup=main_keyboard()
@@ -610,6 +664,14 @@ async def start_handler(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "about")
 async def about_handler(callback: CallbackQuery):
+
+    if is_blocked(callback.from_user.id):
+        await callback.answer(
+            "🚫 Доступ ограничен.",
+            show_alert=True
+        )
+        return
+
     text = (
         "👑 <b>Обо мне</b>\n\n"
         "🌸 Я бот-помощник клана <b>«Крутяшки»</b>.\n\n"
@@ -626,11 +688,14 @@ async def about_handler(callback: CallbackQuery):
     await callback.answer()
 
     try:
+
         await callback.message.edit_caption(
             caption=text,
             reply_markup=main_keyboard()
         )
+
     except Exception:
+
         await callback.message.edit_text(
             text,
             reply_markup=main_keyboard()
@@ -642,7 +707,11 @@ async def about_handler(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "join")
-async def join_handler(callback: CallbackQuery, state: FSMContext):
+async def join_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
     user_id = callback.from_user.id
 
     if is_blocked(user_id):
@@ -654,7 +723,7 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
 
     if has_accepted_application(user_id):
         await callback.answer(
-            "💗 Вы уже были приняты в клан.",
+            "💗 Ты уже был принят в клан.",
             show_alert=True
         )
         return
@@ -669,18 +738,39 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
     rejected = get_last_rejected(user_id)
 
     if rejected and rejected[0]:
+
         try:
-            rejected_time = datetime.fromisoformat(rejected[0])
-            available_time = rejected_time + timedelta(hours=2)
+
+            rejected_time = datetime.fromisoformat(
+                rejected[0]
+            )
+
+            available_time = (
+                rejected_time +
+                timedelta(hours=2)
+            )
 
             if datetime.now() < available_time:
-                remaining = available_time - datetime.now()
-                minutes = max(1, int(remaining.total_seconds() // 60))
+
+                remaining = (
+                    available_time -
+                    datetime.now()
+                )
+
+                minutes = max(
+                    1,
+                    int(
+                        remaining.total_seconds()
+                        // 60
+                    )
+                )
 
                 await callback.answer(
-                    f"⏳ Повторно подать заявку можно примерно через {minutes} мин.",
+                    f"⏳ Повторно подать заявку можно "
+                    f"примерно через {minutes} мин.",
                     show_alert=True
                 )
+
                 return
 
         except Exception:
@@ -688,7 +778,9 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
 
     await callback.answer()
 
-    await state.set_state(ApplicationForm.nickname)
+    await state.set_state(
+        ApplicationForm.nickname
+    )
 
     await callback.message.answer(
         "💗 <b>Заявка на вступление</b>\n\n"
@@ -696,8 +788,16 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
     )
 
 
+# =========================================================
+# FORM: NICKNAME
+# =========================================================
+
 @dp.message(ApplicationForm.nickname)
-async def process_nickname(message: Message, state: FSMContext):
+async def process_nickname(
+    message: Message,
+    state: FSMContext
+):
+
     if is_blocked(message.from_user.id):
         await state.clear()
         return
@@ -705,31 +805,53 @@ async def process_nickname(message: Message, state: FSMContext):
     nickname = message.text.strip()
 
     if len(nickname) < 2 or len(nickname) > 32:
+
         await message.answer(
             "❌ Ник должен содержать от 2 до 32 символов."
         )
+
         return
 
-    await state.update_data(nickname=nickname)
-    await state.set_state(ApplicationForm.reason)
+    await state.update_data(
+        nickname=nickname
+    )
+
+    await state.set_state(
+        ApplicationForm.reason
+    )
 
     await message.answer(
         "2️⃣ Почему ты хочешь вступить в клан?"
     )
 
 
+# =========================================================
+# FORM: REASON
+# =========================================================
+
 @dp.message(ApplicationForm.reason)
-async def process_reason(message: Message, state: FSMContext):
+async def process_reason(
+    message: Message,
+    state: FSMContext
+):
+
     reason = message.text.strip()
 
     if len(reason) < 3:
+
         await message.answer(
             "❌ Напиши хотя бы несколько слов."
         )
+
         return
 
-    await state.update_data(reason=reason)
-    await state.set_state(ApplicationForm.loyal)
+    await state.update_data(
+        reason=reason
+    )
+
+    await state.set_state(
+        ApplicationForm.loyal
+    )
 
     await message.answer(
         "3️⃣ Клянёшься быть верным клану "
@@ -737,6 +859,10 @@ async def process_reason(message: Message, state: FSMContext):
         reply_markup=loyalty_keyboard()
     )
 
+
+# =========================================================
+# FORM: LOYAL
+# =========================================================
 
 @dp.callback_query(
     ApplicationForm.loyal,
@@ -746,14 +872,20 @@ async def process_loyal(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     loyal = (
-        "Да, обещает быть верным клану и уважать Алину 💗"
+        "Да, конечно! 💗"
         if callback.data == "loyal_yes"
         else "Нет"
     )
 
-    await state.update_data(loyal=loyal)
-    await state.set_state(ApplicationForm.pvp)
+    await state.update_data(
+        loyal=loyal
+    )
+
+    await state.set_state(
+        ApplicationForm.pvp
+    )
 
     await callback.answer()
 
@@ -762,70 +894,117 @@ async def process_loyal(
     )
 
 
+# =========================================================
+# FORM: PVP
+# =========================================================
+
 @dp.message(ApplicationForm.pvp)
-async def process_pvp(message: Message, state: FSMContext):
+async def process_pvp(
+    message: Message,
+    state: FSMContext
+):
+
     try:
         pvp = int(message.text.strip())
+
     except ValueError:
+
         await message.answer(
             "❌ Введи число от 1 до 10."
         )
+
         return
 
     if not 1 <= pvp <= 10:
+
         await message.answer(
             "❌ PvP должен быть от 1 до 10."
         )
+
         return
 
-    await state.update_data(pvp=pvp)
-    await state.set_state(ApplicationForm.age)
+    await state.update_data(
+        pvp=pvp
+    )
+
+    await state.set_state(
+        ApplicationForm.age
+    )
 
     await message.answer(
         "5️⃣ Сколько тебе лет?"
     )
 
 
+# =========================================================
+# FORM: AGE
+# =========================================================
+
 @dp.message(ApplicationForm.age)
-async def process_age(message: Message, state: FSMContext):
+async def process_age(
+    message: Message,
+    state: FSMContext
+):
+
     try:
         age = int(message.text.strip())
+
     except ValueError:
+
         await message.answer(
             "❌ Введи возраст числом."
         )
+
         return
 
     if not 5 <= age <= 100:
+
         await message.answer(
             "❌ Укажи реальный возраст."
         )
+
         return
 
-    await state.update_data(age=age)
-    await state.set_state(ApplicationForm.email)
+    await state.update_data(
+        age=age
+    )
+
+    await state.set_state(
+        ApplicationForm.email
+    )
 
     await message.answer(
         "6️⃣ Укажи свою Gmail-почту.\n\n"
-        "📧 Например: <code>example@gmail.com</code>\n\n"
+        "📧 Например:\n"
+        "<code>example@gmail.com</code>\n\n"
         "Почта нужна администрации для отправки "
         "кода вступления."
     )
 
 
+# =========================================================
+# FORM: EMAIL
+# =========================================================
+
 @dp.message(ApplicationForm.email)
-async def process_email(message: Message, state: FSMContext):
+async def process_email(
+    message: Message,
+    state: FSMContext
+):
+
     email = message.text.strip().lower()
 
     if not re.fullmatch(
         r"[a-zA-Z0-9._%+-]+@gmail\.com",
         email
     ):
+
         await message.answer(
             "❌ Похоже, это не Gmail.\n\n"
             "Напиши адрес в формате:\n"
             "<code>example@gmail.com</code>"
         )
+
         return
 
     data = await state.get_data()
@@ -846,9 +1025,9 @@ async def process_email(message: Message, state: FSMContext):
     await message.answer(
         "💗 <b>Заявка отправлена!</b>\n\n"
         f"🆔 Номер заявки: <code>#{application_id}</code>\n\n"
-        "⏳ Теперь администрация рассмотрит её.\n"
-        "Если заявку примут, код вступления будет "
-        "подготовлен администрацией."
+        "⏳ Теперь администрация рассмотрит её.\n\n"
+        "Если заявку примут, код вступления "
+        "будет подготовлен администрацией."
     )
 
     username = (
@@ -873,22 +1052,25 @@ async def process_email(message: Message, state: FSMContext):
     await bot.send_message(
         ADMIN_ID,
         admin_text,
-        reply_markup=admin_application_keyboard(application_id)
+        reply_markup=admin_application_keyboard(
+            application_id
+        )
     )
 
 
 # =========================================================
-# ADMIN COMMAND
+# SECRET ADMIN COMMAND
 # =========================================================
 
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
+
     if message.from_user.id != ADMIN_ID:
         return
 
     await message.answer(
         "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        "Добро пожаловать, главный администратор.\n"
+        "Добро пожаловать, главный администратор.\n\n"
         "Выбери нужный раздел:",
         reply_markup=admin_keyboard()
     )
@@ -900,14 +1082,20 @@ async def admin_command(message: Message):
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     db = get_db()
     cursor = db.cursor()
 
-    cursor.execute("SELECT COUNT(*) FROM applications")
+    cursor.execute(
+        "SELECT COUNT(*) FROM applications"
+    )
     total = cursor.fetchone()[0]
 
     cursor.execute("""
@@ -931,7 +1119,9 @@ async def admin_stats(callback: CallbackQuery):
     """)
     rejected = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM users")
+    cursor.execute(
+        "SELECT COUNT(*) FROM users"
+    )
     users = cursor.fetchone()[0]
 
     cursor.execute("""
@@ -963,8 +1153,12 @@ async def admin_stats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_pending")
 async def admin_pending(callback: CallbackQuery):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     rows = get_pending_applications()
@@ -972,16 +1166,19 @@ async def admin_pending(callback: CallbackQuery):
     await callback.answer()
 
     if not rows:
+
         await callback.message.edit_text(
             "📥 <b>Ожидающие заявки</b>\n\n"
             "✨ Сейчас новых заявок нет.",
             reply_markup=admin_keyboard()
         )
+
         return
 
     text = "📥 <b>ОЖИДАЮЩИЕ ЗАЯВКИ</b>\n\n"
 
     for row in rows:
+
         app_id, user_id, nickname, age, pvp, created_at = row
 
         text += (
@@ -1003,8 +1200,12 @@ async def admin_pending(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_recent")
 async def admin_recent(callback: CallbackQuery):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     rows = get_recent_applications()
@@ -1012,13 +1213,13 @@ async def admin_recent(callback: CallbackQuery):
     await callback.answer()
 
     if not rows:
+
         await callback.message.edit_text(
             "🗂 Заявок пока нет.",
             reply_markup=admin_keyboard()
         )
-        return
 
-    text = "🗂 <b>ПОСЛЕДНИЕ ЗАЯВКИ</b>\n\n"
+        return
 
     status_names = {
         "pending": "⏳",
@@ -1026,8 +1227,18 @@ async def admin_recent(callback: CallbackQuery):
         "rejected": "❌"
     }
 
+    text = "🗂 <b>ПОСЛЕДНИЕ ЗАЯВКИ</b>\n\n"
+
     for row in rows:
-        app_id, nickname, age, pvp, status, created_at = row
+
+        (
+            app_id,
+            nickname,
+            age,
+            pvp,
+            status,
+            created_at
+        ) = row
 
         text += (
             f"{status_names.get(status, '❔')} "
@@ -1047,14 +1258,23 @@ async def admin_recent(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "admin_search")
-async def admin_search(callback: CallbackQuery, state: FSMContext):
+async def admin_search(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     await callback.answer()
 
-    await state.set_state(AdminSearch.waiting_application_id)
+    await state.set_state(
+        AdminSearch.waiting_application_id
+    )
 
     await callback.message.answer(
         "🔎 Введи номер заявки.\n\n"
@@ -1068,23 +1288,33 @@ async def admin_search_result(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
     try:
-        application_id = int(message.text.strip())
+        application_id = int(
+            message.text.strip()
+        )
+
     except ValueError:
+
         await message.answer(
             "❌ Введи номер заявки числом."
         )
+
         return
 
-    application = get_application(application_id)
+    application = get_application(
+        application_id
+    )
 
     if not application:
+
         await message.answer(
             "❌ Такая заявка не найдена."
         )
+
         return
 
     (
@@ -1108,22 +1338,26 @@ async def admin_search_result(
         "🔎 <b>ЗАЯВКА</b>\n\n"
         f"🆔 Номер: <code>#{app_id}</code>\n"
         f"👤 User ID: <code>{user_id}</code>\n"
-        f"👤 Username: @{escape(username) if username else 'нет'}\n\n"
+        f"👤 Username: "
+        f"{'@' + escape(username) if username else 'нет'}\n\n"
         f"🎮 Minecraft: <b>{escape(nickname)}</b>\n"
         f"📝 Причина: {escape(reason)}\n"
         f"💗 Верность: {escape(loyal)}\n"
         f"⚔️ PvP: <b>{pvp}/10</b>\n"
         f"🎂 Возраст: <b>{age}</b>\n"
-        f"📧 Gmail: <code>{escape(email or 'нет')}</code>\n\n"
+        f"📧 Gmail: "
+        f"<code>{escape(email or 'нет')}</code>\n\n"
         f"📌 Статус: <b>{escape(status)}</b>\n"
     )
 
     if join_code:
-        text += f"🔐 Код: <code>{escape(join_code)}</code>\n"
+        text += (
+            f"🔐 Код: <code>{escape(join_code)}</code>\n"
+        )
 
     if decision_message:
         text += (
-            f"\n💬 Сообщение администрации:\n"
+            "\n💬 Сообщение администрации:\n"
             f"{escape(decision_message)}"
         )
 
@@ -1145,35 +1379,52 @@ async def admin_search_result(
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     db = get_db()
     cursor = db.cursor()
 
     cursor.execute("""
-        SELECT user_id, username, first_name, blocked
+        SELECT
+            user_id,
+            username,
+            first_name,
+            blocked
         FROM users
         ORDER BY rowid DESC
         LIMIT 20
     """)
 
     rows = cursor.fetchall()
+
     db.close()
 
     await callback.answer()
 
     if not rows:
+
         await callback.message.edit_text(
             "👥 Пользователей пока нет.",
             reply_markup=admin_keyboard()
         )
+
         return
 
     text = "👥 <b>ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ</b>\n\n"
 
-    for user_id, username, first_name, blocked in rows:
+    for (
+        user_id,
+        username,
+        first_name,
+        blocked
+    ) in rows:
+
         status = "🚫" if blocked else "🟢"
 
         text += (
@@ -1186,11 +1437,6 @@ async def admin_users(callback: CallbackQuery):
 
         text += "\n"
 
-    text += (
-        "\nℹ️ Блокировку можно использовать "
-        "через команду администратора."
-    )
-
     await callback.message.edit_text(
         text,
         reply_markup=admin_keyboard()
@@ -1198,67 +1444,137 @@ async def admin_users(callback: CallbackQuery):
 
 
 # =========================================================
-# ADMIN BLOCK / UNBLOCK
+# ADMIN BLOCK
 # =========================================================
 
-@dp.message(Command("block"))
-async def admin_block(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+@dp.callback_query(F.data == "admin_block")
+async def admin_block_button(
+    callback: CallbackQuery,
+    state: FSMContext
+):
 
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        await message.answer(
-            "Использование:\n"
-            "<code>/block 123456789</code>"
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
         )
         return
 
+    await callback.answer()
+
+    await state.set_state(
+        AdminBlock.waiting_user_id
+    )
+
+    await state.update_data(
+        action="block"
+    )
+
+    await callback.message.answer(
+        "🚫 Введи Telegram ID пользователя.\n\n"
+        "Например:\n"
+        "<code>123456789</code>"
+    )
+
+
+# =========================================================
+# ADMIN UNBLOCK
+# =========================================================
+
+@dp.callback_query(F.data == "admin_unblock")
+async def admin_unblock_button(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
+        return
+
+    await callback.answer()
+
+    await state.set_state(
+        AdminBlock.waiting_user_id
+    )
+
+    await state.update_data(
+        action="unblock"
+    )
+
+    await callback.message.answer(
+        "🔓 Введи Telegram ID пользователя.\n\n"
+        "Например:\n"
+        "<code>123456789</code>"
+    )
+
+
+# =========================================================
+# ADMIN BLOCK / UNBLOCK PROCESS
+# =========================================================
+
+@dp.message(AdminBlock.waiting_user_id)
+async def process_admin_block(
+    message: Message,
+    state: FSMContext
+):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
     try:
-        user_id = int(parts[1])
+        user_id = int(
+            message.text.strip()
+        )
+
     except ValueError:
-        await message.answer("❌ Неверный Telegram ID.")
+
+        await message.answer(
+            "❌ Неверный Telegram ID."
+        )
+
         return
 
     if user_id == ADMIN_ID:
+
         await message.answer(
-            "😄 Себя заблокировать нельзя."
+            "😄 Себя блокировать нельзя."
         )
+
+        await state.clear()
+
         return
 
-    set_blocked(user_id, True)
+    data = await state.get_data()
+    action = data.get("action")
 
-    await message.answer(
-        f"🚫 Пользователь <code>{user_id}</code> заблокирован."
-    )
+    if action == "block":
 
+        set_blocked(
+            user_id,
+            True
+        )
 
-@dp.message(Command("unblock"))
-async def admin_unblock(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
         await message.answer(
-            "Использование:\n"
-            "<code>/unblock 123456789</code>"
+            f"🚫 Пользователь "
+            f"<code>{user_id}</code> заблокирован."
         )
-        return
 
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ Неверный Telegram ID.")
-        return
+    else:
 
-    set_blocked(user_id, False)
+        set_blocked(
+            user_id,
+            False
+        )
 
-    await message.answer(
-        f"🔓 Пользователь <code>{user_id}</code> разблокирован."
-    )
+        await message.answer(
+            f"🔓 Пользователь "
+            f"<code>{user_id}</code> разблокирован."
+        )
+
+    await state.clear()
 
 
 # =========================================================
@@ -1270,18 +1586,24 @@ async def admin_broadcast(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True
+        )
         return
 
     await callback.answer()
 
-    await state.set_state(AdminBroadcast.waiting_message)
+    await state.set_state(
+        AdminBroadcast.waiting_message
+    )
 
     await callback.message.answer(
         "📢 <b>Рассылка</b>\n\n"
-        "Отправь сообщение, которое нужно разослать "
-        "пользователям бота.\n\n"
+        "Отправь текст сообщения, которое нужно "
+        "разослать пользователям.\n\n"
         "⚠️ Рассылка уйдёт всем незаблокированным "
         "пользователям."
     )
@@ -1292,15 +1614,18 @@ async def process_broadcast(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
-    text = message.text or message.caption
+    text = message.text
 
     if not text:
+
         await message.answer(
-            "❌ Для рассылки сейчас поддерживается текст."
+            "❌ Отправь именно текстовое сообщение."
         )
+
         return
 
     users = get_all_users()
@@ -1309,12 +1634,14 @@ async def process_broadcast(
     failed = 0
 
     await message.answer(
-        f"📢 Начинаю рассылку...\n"
-        f"👥 Получателей: {len(users)}"
+        f"📢 Начинаю рассылку...\n\n"
+        f"👥 Получателей: <b>{len(users)}</b>"
     )
 
     for user_id in users:
+
         try:
+
             await bot.send_message(
                 user_id,
                 text
@@ -1325,6 +1652,7 @@ async def process_broadcast(
             await asyncio.sleep(0.05)
 
         except Exception:
+
             failed += 1
 
     await state.clear()
@@ -1337,7 +1665,7 @@ async def process_broadcast(
 
 
 # =========================================================
-# ACCEPT / REJECT
+# ACCEPT APPLICATION
 # =========================================================
 
 @dp.callback_query(F.data.startswith("accept:"))
@@ -1345,33 +1673,42 @@ async def accept_application(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
+
         await callback.answer(
             "Нет доступа.",
             show_alert=True
         )
+
         return
 
     application_id = int(
         callback.data.split(":")[1]
     )
 
-    application = get_application(application_id)
+    application = get_application(
+        application_id
+    )
 
     if not application:
+
         await callback.answer(
             "Заявка не найдена.",
             show_alert=True
         )
+
         return
 
     status = application[8]
 
     if status != "pending":
+
         await callback.answer(
             f"Заявка уже обработана: {status}",
             show_alert=True
         )
+
         return
 
     await state.update_data(
@@ -1396,38 +1733,51 @@ async def accept_application(
     )
 
 
+# =========================================================
+# REJECT APPLICATION
+# =========================================================
+
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_application(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
+
         await callback.answer(
             "Нет доступа.",
             show_alert=True
         )
+
         return
 
     application_id = int(
         callback.data.split(":")[1]
     )
 
-    application = get_application(application_id)
+    application = get_application(
+        application_id
+    )
 
     if not application:
+
         await callback.answer(
             "Заявка не найдена.",
             show_alert=True
         )
+
         return
 
     status = application[8]
 
     if status != "pending":
+
         await callback.answer(
             f"Заявка уже обработана: {status}",
             show_alert=True
         )
+
         return
 
     await state.update_data(
@@ -1445,8 +1795,8 @@ async def reject_application(
         "❌ <b>Заявка будет ОТКЛОНЕНА.</b>\n\n"
         "Напиши сообщение, которое отправить пользователю.\n\n"
         "Например:\n"
-        "<i>К сожалению, сейчас мы не можем принять "
-        "тебя. Попробуй подать заявку снова через 2 часа.</i>"
+        "К сожалению, сейчас мы не можем принять "
+        "тебя. Попробуй подать заявку снова через 2 часа."
     )
 
 
@@ -1459,27 +1809,40 @@ async def admin_decision_message(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
-        return
-
-    data = await state.get_data()
-
-    application_id = data.get("application_id")
-    decision = data.get("decision")
-
-    if not application_id or not decision:
-        await state.clear()
         return
 
     decision_message = message.text.strip()
 
-    application = get_application(application_id)
+    data = await state.get_data()
+
+    application_id = data.get(
+        "application_id"
+    )
+
+    decision = data.get(
+        "decision"
+    )
+
+    if not application_id or not decision:
+
+        await state.clear()
+
+        return
+
+    application = get_application(
+        application_id
+    )
 
     if not application:
+
         await message.answer(
-            "❌ Заявка больше не найдена."
+            "❌ Заявка не найдена."
         )
+
         await state.clear()
+
         return
 
     (
@@ -1500,13 +1863,21 @@ async def admin_decision_message(
     ) = application
 
     if status != "pending":
+
         await message.answer(
-            "⚠️ Эта заявка уже была обработана."
+            "⚠️ Эта заявка уже обработана."
         )
+
         await state.clear()
+
         return
 
+    # =====================================================
+    # ACCEPT
+    # =====================================================
+
     if decision == "accepted":
+
         join_code = generate_join_code()
 
         update_application(
@@ -1517,6 +1888,7 @@ async def admin_decision_message(
         )
 
         try:
+
             await bot.send_message(
                 user_id,
                 "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\n"
@@ -1531,14 +1903,15 @@ async def admin_decision_message(
             user_sent = True
 
         except Exception:
+
             user_sent = False
 
         email_text = (
             "Здравствуйте! 🌸\n\n"
-            f"Ваша заявка в клан «Крутяшки» была принята.\n\n"
+            "Ваша заявка в клан «Крутяшки» была принята.\n\n"
             f"Ваш код вступления:\n"
             f"{join_code}\n\n"
-            f"Сообщение от администрации:\n"
+            "Сообщение от администрации:\n"
             f"{decision_message}\n\n"
             "Добро пожаловать! 💗"
         )
@@ -1556,12 +1929,18 @@ async def admin_decision_message(
             + (
                 "✅ Пользователь уведомлён в Telegram."
                 if user_sent
-                else "⚠️ Не удалось отправить сообщение пользователю."
+                else
+                "⚠️ Не удалось отправить сообщение пользователю."
             ),
             reply_markup=admin_keyboard()
         )
 
+    # =====================================================
+    # REJECT
+    # =====================================================
+
     else:
+
         update_application(
             application_id=application_id,
             status="rejected",
@@ -1570,6 +1949,7 @@ async def admin_decision_message(
         )
 
         try:
+
             await bot.send_message(
                 user_id,
                 "💔 <b>Заявка отклонена</b>\n\n"
@@ -1580,6 +1960,7 @@ async def admin_decision_message(
             user_sent = True
 
         except Exception:
+
             user_sent = False
 
         await message.answer(
@@ -1589,7 +1970,8 @@ async def admin_decision_message(
             + (
                 "✅ Пользователь уведомлён."
                 if user_sent
-                else "⚠️ Не удалось уведомить пользователя."
+                else
+                "⚠️ Не удалось уведомить пользователя."
             ),
             reply_markup=admin_keyboard()
         )
@@ -1606,6 +1988,7 @@ async def cancel_command(
     message: Message,
     state: FSMContext
 ):
+
     await state.clear()
 
     await message.answer(
@@ -1619,12 +2002,14 @@ async def cancel_command(
 
 @dp.message()
 async def blocked_check(message: Message):
+
     if message.from_user.id == ADMIN_ID:
         return
 
     save_user(message)
 
     if is_blocked(message.from_user.id):
+
         await message.answer(
             "🚫 Доступ к боту ограничен администрацией."
         )
@@ -1635,9 +2020,12 @@ async def blocked_check(message: Message):
 # =========================================================
 
 async def main():
+
     init_db()
 
-    logging.info("Бот запущен.")
+    logging.info(
+        "Бот «Крутяшки» запущен."
+    )
 
     await dp.start_polling(bot)
 
