@@ -28,14 +28,20 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
 ADMIN_ID = 1541550837
 
 DB_FILE = "krutyashki.sqlite3"
 IMAGE_FILE = "alina.jpg"
 
+OFFICIAL_CHANNEL = "https://t.me/+eOQvGXnjFNc3Mzkx"
+ALINA_USERNAME = "@alino4ka_princes"
+
+REAPPLY_COOLDOWN_HOURS = 2
+
 
 # =========================================================
-# LOGGING
+# ЛОГИ
 # =========================================================
 
 logging.basicConfig(
@@ -43,20 +49,15 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-
-# =========================================================
-# ПРОВЕРКА ТОКЕНА
-# =========================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не найден. Добавь его в Railway → Variables."
-    )
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
 # BOT
 # =========================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не найден BOT_TOKEN в переменных окружения Railway.")
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -69,7 +70,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 # =========================================================
-# СОСТОЯНИЯ
+# FSM
 # =========================================================
 
 class ApplicationForm(StatesGroup):
@@ -77,24 +78,29 @@ class ApplicationForm(StatesGroup):
     reason = State()
     loyal = State()
     pvp = State()
+    pve = State()
     age = State()
     email = State()
 
 
 class AdminDecision(StatesGroup):
-    waiting_message = State()
+    message = State()
 
 
 class AdminSearch(StatesGroup):
-    waiting_application_id = State()
-
-
-class AdminBroadcast(StatesGroup):
-    waiting_message = State()
+    application_id = State()
 
 
 class AdminBlock(StatesGroup):
-    waiting_user_id = State()
+    user_id = State()
+
+
+class AdminUnblock(StatesGroup):
+    user_id = State()
+
+
+class AdminBroadcast(StatesGroup):
+    message = State()
 
 
 # =========================================================
@@ -106,21 +112,22 @@ def get_db():
 
 
 def init_db():
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS applications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             username TEXT,
-            nickname TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            loyal TEXT NOT NULL,
-            pvp INTEGER NOT NULL,
-            age INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
+            nickname TEXT,
+            reason TEXT,
+            loyal TEXT,
+            pvp INTEGER,
+            pve INTEGER,
+            age INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
             decided_at TEXT,
             decision_message TEXT,
             email TEXT,
@@ -128,32 +135,34 @@ def init_db():
         )
     """)
 
-    cursor.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            created_at TEXT NOT NULL,
-            blocked INTEGER NOT NULL DEFAULT 0
+            created_at TEXT,
+            blocked INTEGER DEFAULT 0
         )
     """)
 
-    # Миграция старой базы
-    cursor.execute("PRAGMA table_info(applications)")
-    columns = {row[1] for row in cursor.fetchall()}
+    # -----------------------------------------------------
+    # Миграции старой БД
+    # -----------------------------------------------------
+
+    cur.execute("PRAGMA table_info(applications)")
+    columns = [row[1] for row in cur.fetchall()]
+
+    if "pve" not in columns:
+        cur.execute("ALTER TABLE applications ADD COLUMN pve INTEGER")
 
     if "email" not in columns:
-        cursor.execute(
-            "ALTER TABLE applications ADD COLUMN email TEXT"
-        )
+        cur.execute("ALTER TABLE applications ADD COLUMN email TEXT")
 
     if "join_code" not in columns:
-        cursor.execute(
-            "ALTER TABLE applications ADD COLUMN join_code TEXT"
-        )
+        cur.execute("ALTER TABLE applications ADD COLUMN join_code TEXT")
 
-    db.commit()
-    db.close()
+    conn.commit()
+    conn.close()
 
 
 # =========================================================
@@ -161,343 +170,188 @@ def init_db():
 # =========================================================
 
 def save_user(message: Message):
-    user = message.from_user
+    conn = get_db()
+    cur = conn.cursor()
 
-    db = get_db()
-    cursor = db.cursor()
+    now = datetime.now().isoformat()
 
-    cursor.execute("""
+    cur.execute("""
         INSERT INTO users (
             user_id,
             username,
             first_name,
-            created_at
+            created_at,
+            blocked
         )
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
+        VALUES (?, ?, ?, ?, 0)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name
     """, (
-        user.id,
-        user.username,
-        user.first_name,
-        datetime.now().isoformat()
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+        now
     ))
 
-    db.commit()
-    db.close()
+    conn.commit()
+    conn.close()
 
 
 def is_blocked(user_id: int) -> bool:
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute(
+    cur.execute(
         "SELECT blocked FROM users WHERE user_id = ?",
         (user_id,)
     )
 
-    row = cursor.fetchone()
+    row = cur.fetchone()
 
-    db.close()
+    conn.close()
 
     return bool(row and row[0] == 1)
 
 
-def set_blocked(user_id: int, blocked: bool):
-    db = get_db()
-    cursor = db.cursor()
+def set_blocked(user_id: int, value: bool):
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         INSERT INTO users (
             user_id,
+            username,
+            first_name,
             created_at,
             blocked
         )
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            blocked = excluded.blocked
+        VALUES (?, '', '', ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET blocked = excluded.blocked
     """, (
         user_id,
         datetime.now().isoformat(),
-        1 if blocked else 0
+        1 if value else 0
     ))
 
-    db.commit()
-    db.close()
+    conn.commit()
+    conn.close()
 
 
 def get_all_users():
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         SELECT user_id
         FROM users
         WHERE blocked = 0
     """)
 
-    rows = cursor.fetchall()
+    rows = cur.fetchall()
 
-    db.close()
+    conn.close()
 
     return [row[0] for row in rows]
 
 
 # =========================================================
-# APPLICATIONS
+# APPLICATION HELPERS
 # =========================================================
 
-def create_application(
-    user_id,
-    username,
-    nickname,
-    reason,
-    loyal,
-    pvp,
-    age,
-    email
-):
-    db = get_db()
-    cursor = db.cursor()
+def get_user_application(user_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
-        INSERT INTO applications (
-            user_id,
-            username,
-            nickname,
-            reason,
-            loyal,
-            pvp,
-            age,
-            status,
-            created_at,
-            email
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-    """, (
-        user_id,
-        username,
-        nickname,
-        reason,
-        loyal,
-        pvp,
-        age,
-        datetime.now().isoformat(),
-        email
-    ))
-
-    application_id = cursor.lastrowid
-
-    db.commit()
-    db.close()
-
-    return application_id
-
-
-def get_application(application_id):
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        SELECT
-            id,
-            user_id,
-            username,
-            nickname,
-            reason,
-            loyal,
-            pvp,
-            age,
-            status,
-            email,
-            join_code,
-            created_at,
-            decided_at,
-            decision_message
-        FROM applications
-        WHERE id = ?
-    """, (application_id,))
-
-    row = cursor.fetchone()
-
-    db.close()
-
-    return row
-
-
-def get_pending_applications():
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        SELECT
-            id,
-            user_id,
-            nickname,
-            age,
-            pvp,
-            created_at
-        FROM applications
-        WHERE status = 'pending'
-        ORDER BY id DESC
-        LIMIT 20
-    """)
-
-    rows = cursor.fetchall()
-
-    db.close()
-
-    return rows
-
-
-def get_recent_applications():
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        SELECT
-            id,
-            nickname,
-            age,
-            pvp,
-            status,
-            created_at
-        FROM applications
-        ORDER BY id DESC
-        LIMIT 15
-    """)
-
-    rows = cursor.fetchall()
-
-    db.close()
-
-    return rows
-
-
-def has_pending_application(user_id: int):
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        SELECT id
+    cur.execute("""
+        SELECT *
         FROM applications
         WHERE user_id = ?
-        AND status = 'pending'
+        ORDER BY id DESC
         LIMIT 1
     """, (user_id,))
 
-    row = cursor.fetchone()
+    row = cur.fetchone()
 
-    db.close()
-
-    return row
-
-
-def has_accepted_application(user_id: int):
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        SELECT id
-        FROM applications
-        WHERE user_id = ?
-        AND status = 'accepted'
-        LIMIT 1
-    """, (user_id,))
-
-    row = cursor.fetchone()
-
-    db.close()
+    conn.close()
 
     return row
 
 
-def get_last_rejected(user_id: int):
-    db = get_db()
-    cursor = db.cursor()
+def get_last_rejected_application(user_id: int):
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         SELECT decided_at
         FROM applications
         WHERE user_id = ?
-        AND status = 'rejected'
+          AND status = 'rejected'
         ORDER BY id DESC
         LIMIT 1
     """, (user_id,))
 
-    row = cursor.fetchone()
+    row = cur.fetchone()
 
-    db.close()
+    conn.close()
 
-    return row
-
-
-def update_application(
-    application_id,
-    status,
-    decision_message,
-    join_code=None
-):
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute("""
-        UPDATE applications
-        SET
-            status = ?,
-            decided_at = ?,
-            decision_message = ?,
-            join_code = ?
-        WHERE id = ?
-    """, (
-        status,
-        datetime.now().isoformat(),
-        decision_message,
-        join_code,
-        application_id
-    ))
-
-    db.commit()
-    db.close()
+    return row[0] if row else None
 
 
-# =========================================================
-# JOIN CODE
-# =========================================================
+def application_exists_pending(user_id: int) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id
+        FROM applications
+        WHERE user_id = ?
+          AND status = 'pending'
+        LIMIT 1
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return row is not None
+
+
+def has_accepted_application(user_id: int) -> bool:
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id
+        FROM applications
+        WHERE user_id = ?
+          AND status = 'accepted'
+        LIMIT 1
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    return row is not None
+
 
 def generate_join_code():
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-    while True:
+    part1 = "".join(
+        secrets.choice(alphabet)
+        for _ in range(4)
+    )
 
-        part1 = "".join(
-            secrets.choice(alphabet)
-            for _ in range(4)
-        )
+    part2 = "".join(
+        secrets.choice(alphabet)
+        for _ in range(4)
+    )
 
-        part2 = "".join(
-            secrets.choice(alphabet)
-            for _ in range(4)
-        )
-
-        code = f"KRUT-{part1}-{part2}"
-
-        db = get_db()
-        cursor = db.cursor()
-
-        cursor.execute("""
-            SELECT id
-            FROM applications
-            WHERE join_code = ?
-        """, (code,))
-
-        exists = cursor.fetchone()
-
-        db.close()
-
-        if not exists:
-            return code
+    return f"KRUT-{part1}-{part2}"
 
 
 # =========================================================
@@ -518,21 +372,25 @@ def main_keyboard():
                     text="👑 Обо мне",
                     callback_data="about"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Официальный канал",
+                    url=OFFICIAL_CHANNEL
+                )
             ]
         ]
     )
 
 
-def loyalty_keyboard():
+def loyal_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💗 Да, конечно!",
+                    text="💗 Да",
                     callback_data="loyal_yes"
-                )
-            ],
-            [
+                ),
                 InlineKeyboardButton(
                     text="❌ Нет",
                     callback_data="loyal_no"
@@ -542,17 +400,38 @@ def loyalty_keyboard():
     )
 
 
-def admin_application_keyboard(application_id):
+def rating_keyboard(prefix: str):
+    buttons = []
+
+    for start in (1, 6):
+        row = []
+
+        for number in range(start, start + 5):
+            row.append(
+                InlineKeyboardButton(
+                    text=str(number),
+                    callback_data=f"{prefix}_{number}"
+                )
+            )
+
+        buttons.append(row)
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
+
+
+def admin_application_keyboard(app_id: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="✅ Принять",
-                    callback_data=f"accept:{application_id}"
+                    callback_data=f"accept_{app_id}"
                 ),
                 InlineKeyboardButton(
                     text="❌ Отклонить",
-                    callback_data=f"reject:{application_id}"
+                    callback_data=f"reject_{app_id}"
                 )
             ]
         ]
@@ -570,13 +449,11 @@ def admin_keyboard():
             ],
             [
                 InlineKeyboardButton(
-                    text="📥 Ожидающие заявки",
+                    text="📥 Заявки",
                     callback_data="admin_pending"
-                )
-            ],
-            [
+                ),
                 InlineKeyboardButton(
-                    text="🗂 Последние заявки",
+                    text="🗂 Последние",
                     callback_data="admin_recent"
                 )
             ],
@@ -596,9 +473,7 @@ def admin_keyboard():
                 InlineKeyboardButton(
                     text="🚫 Заблокировать",
                     callback_data="admin_block"
-                )
-            ],
-            [
+                ),
                 InlineKeyboardButton(
                     text="🔓 Разблокировать",
                     callback_data="admin_unblock"
@@ -615,47 +490,94 @@ def admin_keyboard():
 
 
 # =========================================================
-# START
+# /START
 # =========================================================
 
 @dp.message(CommandStart())
-async def start_handler(
-    message: Message,
-    state: FSMContext
-):
+async def start_handler(message: Message, state: FSMContext):
     await state.clear()
 
     save_user(message)
 
     if is_blocked(message.from_user.id):
         await message.answer(
-            "🚫 Доступ к боту временно ограничен администрацией."
+            "🚫 <b>Доступ ограничен.</b>\n\n"
+            "Вы не можете использовать этого бота."
         )
         return
 
-    text = (
-        "🌸 <b>Добро пожаловать в бот клана «Крутяшки»!</b>\n\n"
-        "💗 Здесь можно подать заявку на вступление "
-        "в клан Алиночки-принцессы.\n\n"
-        "👑 Выбери действие ниже:"
+    # -----------------------------------------------------
+    # Первый экран — 3 секунды
+    # -----------------------------------------------------
+
+    splash = await message.answer(
+        "✓ <b>Официальный бот Алины</b>\n\n"
+        "Загрузка..."
     )
 
-    if os.path.exists(IMAGE_FILE):
+    await asyncio.sleep(3)
 
-        photo = FSInputFile(IMAGE_FILE)
+    # -----------------------------------------------------
+    # Ещё 5 секунд загрузки
+    # -----------------------------------------------------
 
-        await message.answer_photo(
-            photo=photo,
-            caption=text,
-            reply_markup=main_keyboard()
-        )
+    loading_frames = [
+        "Загрузка.\n\n▫️▫️▫️▫️▫️",
+        "Загрузка..\n\n🟩▫️▫️▫️▫️",
+        "Загрузка...\n\n🟩🟩▫️▫️▫️",
+        "Загрузка...\n\n🟩🟩🟩▫️▫️",
+        "Загрузка...\n\n🟩🟩🟩🟩▫️",
+        "Загрузка...\n\n🟩🟩🟩🟩🟩",
+    ]
 
-    else:
+    for frame in loading_frames:
+        try:
+            await splash.edit_text(
+                "✓ <b>Официальный бот Алины</b>\n\n"
+                f"{frame}"
+            )
+        except Exception:
+            pass
 
-        await message.answer(
-            text,
-            reply_markup=main_keyboard()
-        )
+        await asyncio.sleep(5 / len(loading_frames))
+
+    # -----------------------------------------------------
+    # Основной интерфейс
+    # -----------------------------------------------------
+
+    text = (
+        "💗 <b>Добро пожаловать!</b>\n\n"
+        "Это официальный бот клана <b>Крутяшки</b>.\n\n"
+        "Здесь ты можешь подать заявку на вступление "
+        "и узнать информацию о клане.\n\n"
+        f"👑 Создатель: {ALINA_USERNAME}"
+    )
+
+    try:
+        if os.path.exists(IMAGE_FILE):
+            await splash.delete()
+
+            await message.answer_photo(
+                photo=FSInputFile(IMAGE_FILE),
+                caption=text,
+                reply_markup=main_keyboard()
+            )
+        else:
+            await splash.edit_text(
+                text,
+                reply_markup=main_keyboard()
+            )
+
+    except Exception as e:
+        logger.error("Ошибка отправки главного меню: %s", e)
+
+        try:
+            await splash.edit_text(
+                text,
+                reply_markup=main_keyboard()
+            )
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -664,42 +586,28 @@ async def start_handler(
 
 @dp.callback_query(F.data == "about")
 async def about_handler(callback: CallbackQuery):
-
-    if is_blocked(callback.from_user.id):
-        await callback.answer(
-            "🚫 Доступ ограничен.",
-            show_alert=True
-        )
-        return
-
     text = (
         "👑 <b>Обо мне</b>\n\n"
-        "🌸 Я бот-помощник клана <b>«Крутяшки»</b>.\n\n"
-        "💗 Через меня можно подать заявку "
-        "на вступление в клан Алиночки.\n\n"
-        "👑 Главная принцесса:\n"
-        "@alino4ka_princes\n\n"
-        "✨ Здесь можно узнать о вступлении, "
-        "отправить анкету и получить решение администрации.\n\n"
-        "💞 Даже если сейчас набор закрыт, "
-        "ты всё равно можешь оставить заявку."
+        "Я — бот-помощник клана <b>Крутяшки</b>.\n\n"
+        "Здесь можно подать заявку на вступление "
+        "в клан Алины.\n\n"
+        "💗 Оригинал Алины:\n"
+        f"{ALINA_USERNAME}\n\n"
+        "📢 Официальный канал:\n"
+        f"{OFFICIAL_CHANNEL}\n\n"
+        "✨ Бот создан специально для удобного "
+        "приёма заявок и общения с участниками."
+    )
+
+    await callback.message.edit_caption(
+        caption=text,
+        reply_markup=main_keyboard()
+    ) if callback.message.photo else await callback.message.edit_text(
+        text,
+        reply_markup=main_keyboard()
     )
 
     await callback.answer()
-
-    try:
-
-        await callback.message.edit_caption(
-            caption=text,
-            reply_markup=main_keyboard()
-        )
-
-    except Exception:
-
-        await callback.message.edit_text(
-            text,
-            reply_markup=main_keyboard()
-        )
 
 
 # =========================================================
@@ -707,371 +615,358 @@ async def about_handler(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "join")
-async def join_handler(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
+async def join_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
 
     if is_blocked(user_id):
         await callback.answer(
-            "🚫 Доступ ограничен.",
+            "Доступ ограничен.",
             show_alert=True
         )
         return
 
     if has_accepted_application(user_id):
         await callback.answer(
-            "💗 Ты уже был принят в клан.",
+            "Вы уже приняты в клан!",
             show_alert=True
         )
         return
 
-    if has_pending_application(user_id):
+    if application_exists_pending(user_id):
         await callback.answer(
-            "⏳ У тебя уже есть заявка на рассмотрении.",
+            "Ваша заявка уже находится на рассмотрении.",
             show_alert=True
         )
         return
 
-    rejected = get_last_rejected(user_id)
+    last_rejected = get_last_rejected_application(user_id)
 
-    if rejected and rejected[0]:
-
+    if last_rejected:
         try:
+            rejected_time = datetime.fromisoformat(last_rejected)
 
-            rejected_time = datetime.fromisoformat(
-                rejected[0]
-            )
-
-            available_time = (
-                rejected_time +
-                timedelta(hours=2)
-            )
-
-            if datetime.now() < available_time:
-
+            if datetime.now() < rejected_time + timedelta(
+                hours=REAPPLY_COOLDOWN_HOURS
+            ):
                 remaining = (
-                    available_time -
-                    datetime.now()
+                    rejected_time
+                    + timedelta(hours=REAPPLY_COOLDOWN_HOURS)
+                    - datetime.now()
                 )
 
                 minutes = max(
                     1,
-                    int(
-                        remaining.total_seconds()
-                        // 60
-                    )
+                    int(remaining.total_seconds() // 60)
                 )
 
                 await callback.answer(
-                    f"⏳ Повторно подать заявку можно "
-                    f"примерно через {minutes} мин.",
+                    f"Повторно подать заявку можно примерно через {minutes} мин.",
                     show_alert=True
                 )
-
                 return
 
         except Exception:
             pass
 
-    await callback.answer()
-
-    await state.set_state(
-        ApplicationForm.nickname
-    )
+    await state.set_state(ApplicationForm.nickname)
 
     await callback.message.answer(
         "💗 <b>Заявка на вступление</b>\n\n"
-        "1️⃣ Напиши свой Minecraft-ник:"
+        "Шаг 1 из 7\n\n"
+        "🎮 Напиши свой <b>Minecraft ник</b>:"
     )
+
+    await callback.answer()
 
 
 # =========================================================
-# FORM: NICKNAME
+# NICKNAME
 # =========================================================
 
 @dp.message(ApplicationForm.nickname)
-async def process_nickname(
-    message: Message,
-    state: FSMContext
-):
-
+async def nickname_handler(message: Message, state: FSMContext):
     if is_blocked(message.from_user.id):
+        await message.answer("🚫 Доступ ограничен.")
         await state.clear()
         return
 
     nickname = message.text.strip()
 
     if len(nickname) < 2 or len(nickname) > 32:
-
         await message.answer(
-            "❌ Ник должен содержать от 2 до 32 символов."
+            "❌ Ник должен содержать от 2 до 32 символов.\n"
+            "Попробуй ещё раз:"
         )
-
         return
 
-    await state.update_data(
-        nickname=nickname
-    )
-
-    await state.set_state(
-        ApplicationForm.reason
-    )
+    await state.update_data(nickname=nickname)
+    await state.set_state(ApplicationForm.reason)
 
     await message.answer(
-        "2️⃣ Почему ты хочешь вступить в клан?"
+        "📝 <b>Шаг 2 из 7</b>\n\n"
+        "Почему ты хочешь вступить в клан?"
     )
 
 
 # =========================================================
-# FORM: REASON
+# REASON
 # =========================================================
 
 @dp.message(ApplicationForm.reason)
-async def process_reason(
-    message: Message,
-    state: FSMContext
-):
-
+async def reason_handler(message: Message, state: FSMContext):
     reason = message.text.strip()
 
     if len(reason) < 3:
-
         await message.answer(
-            "❌ Напиши хотя бы несколько слов."
+            "Напиши немного подробнее, почему хочешь вступить:"
         )
-
         return
 
-    await state.update_data(
-        reason=reason
-    )
-
-    await state.set_state(
-        ApplicationForm.loyal
-    )
+    await state.update_data(reason=reason)
+    await state.set_state(ApplicationForm.loyal)
 
     await message.answer(
-        "3️⃣ Клянёшься быть верным клану "
-        "и уважать Алину? 💗",
-        reply_markup=loyalty_keyboard()
+        "💗 <b>Шаг 3 из 7</b>\n\n"
+        "Готов ли ты быть верным клану и уважать Алину?",
+        reply_markup=loyal_keyboard()
     )
 
 
 # =========================================================
-# FORM: LOYAL
+# LOYAL
 # =========================================================
 
 @dp.callback_query(
     ApplicationForm.loyal,
-    F.data.in_(["loyal_yes", "loyal_no"])
+    F.data.in_({"loyal_yes", "loyal_no"})
 )
-async def process_loyal(
+async def loyal_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
+    if callback.data == "loyal_yes":
+        loyal = "Да"
+    else:
+        loyal = "Нет"
 
-    loyal = (
-        "Да, конечно! 💗"
-        if callback.data == "loyal_yes"
-        else "Нет"
-    )
+    await state.update_data(loyal=loyal)
+    await state.set_state(ApplicationForm.pvp)
 
-    await state.update_data(
-        loyal=loyal
-    )
-
-    await state.set_state(
-        ApplicationForm.pvp
+    await callback.message.answer(
+        "⚔️ <b>Шаг 4 из 7</b>\n\n"
+        "Оцени свой <b>PvP</b> от 1 до 10:\n\n"
+        "1 — начинающий\n"
+        "10 — очень сильный игрок",
+        reply_markup=rating_keyboard("pvp")
     )
 
     await callback.answer()
 
-    await callback.message.answer(
-        "4️⃣ Оцени свой PvP от 1 до 10:"
-    )
-
 
 # =========================================================
-# FORM: PVP
+# PVP
 # =========================================================
 
-@dp.message(ApplicationForm.pvp)
-async def process_pvp(
-    message: Message,
+@dp.callback_query(
+    ApplicationForm.pvp,
+    F.data.regexp(r"^pvp_(10|[1-9])$")
+)
+async def pvp_handler(
+    callback: CallbackQuery,
     state: FSMContext
 ):
+    pvp = int(callback.data.split("_")[1])
 
-    try:
-        pvp = int(message.text.strip())
+    await state.update_data(pvp=pvp)
+    await state.set_state(ApplicationForm.pve)
 
-    except ValueError:
-
-        await message.answer(
-            "❌ Введи число от 1 до 10."
-        )
-
-        return
-
-    if not 1 <= pvp <= 10:
-
-        await message.answer(
-            "❌ PvP должен быть от 1 до 10."
-        )
-
-        return
-
-    await state.update_data(
-        pvp=pvp
+    await callback.message.answer(
+        "⛏️ <b>Шаг 5 из 7</b>\n\n"
+        "Оцени свои навыки <b>PvE</b> от 1 до 10:\n\n"
+        "1 — начинающий\n"
+        "10 — очень сильный игрок",
+        reply_markup=rating_keyboard("pve")
     )
 
-    await state.set_state(
-        ApplicationForm.age
-    )
-
-    await message.answer(
-        "5️⃣ Сколько тебе лет?"
-    )
+    await callback.answer()
 
 
 # =========================================================
-# FORM: AGE
+# PVE
+# =========================================================
+
+@dp.callback_query(
+    ApplicationForm.pve,
+    F.data.regexp(r"^pve_(10|[1-9])$")
+)
+async def pve_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    pve = int(callback.data.split("_")[1])
+
+    await state.update_data(pve=pve)
+    await state.set_state(ApplicationForm.age)
+
+    await callback.message.answer(
+        "🎂 <b>Шаг 6 из 7</b>\n\n"
+        "Сколько тебе лет?"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# AGE
 # =========================================================
 
 @dp.message(ApplicationForm.age)
-async def process_age(
-    message: Message,
-    state: FSMContext
-):
+async def age_handler(message: Message, state: FSMContext):
+    text = message.text.strip()
 
-    try:
-        age = int(message.text.strip())
-
-    except ValueError:
-
+    if not text.isdigit():
         await message.answer(
-            "❌ Введи возраст числом."
+            "❌ Напиши возраст числом."
         )
-
         return
 
-    if not 5 <= age <= 100:
+    age = int(text)
 
+    if age < 1 or age > 100:
         await message.answer(
-            "❌ Укажи реальный возраст."
+            "❌ Укажи корректный возраст."
         )
-
         return
 
-    await state.update_data(
-        age=age
-    )
-
-    await state.set_state(
-        ApplicationForm.email
-    )
+    await state.update_data(age=age)
+    await state.set_state(ApplicationForm.email)
 
     await message.answer(
-        "6️⃣ Укажи свою Gmail-почту.\n\n"
-        "📧 Например:\n"
-        "<code>example@gmail.com</code>\n\n"
-        "Почта нужна администрации для отправки "
-        "кода вступления."
+        "📧 <b>Шаг 7 из 7</b>\n\n"
+        "Укажи свой Gmail для связи:\n\n"
+        "Например:\n"
+        "<code>example@gmail.com</code>"
     )
 
 
 # =========================================================
-# FORM: EMAIL
+# EMAIL
 # =========================================================
 
 @dp.message(ApplicationForm.email)
-async def process_email(
-    message: Message,
-    state: FSMContext
-):
-
+async def email_handler(message: Message, state: FSMContext):
     email = message.text.strip().lower()
 
     if not re.fullmatch(
         r"[a-zA-Z0-9._%+-]+@gmail\.com",
         email
     ):
-
         await message.answer(
-            "❌ Похоже, это не Gmail.\n\n"
-            "Напиши адрес в формате:\n"
+            "❌ Нужен именно адрес Gmail.\n\n"
+            "Пример:\n"
             "<code>example@gmail.com</code>"
         )
-
         return
 
     data = await state.get_data()
 
-    application_id = create_application(
-        user_id=message.from_user.id,
-        username=message.from_user.username,
-        nickname=data["nickname"],
-        reason=data["reason"],
-        loyal=data["loyal"],
-        pvp=data["pvp"],
-        age=data["age"],
-        email=email
-    )
+    conn = get_db()
+    cur = conn.cursor()
+
+    now = datetime.now().isoformat()
+
+    cur.execute("""
+        INSERT INTO applications (
+            user_id,
+            username,
+            nickname,
+            reason,
+            loyal,
+            pvp,
+            pve,
+            age,
+            status,
+            created_at,
+            email,
+            join_code
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        message.from_user.id,
+        message.from_user.username,
+        data["nickname"],
+        data["reason"],
+        data["loyal"],
+        data["pvp"],
+        data["pve"],
+        data["age"],
+        "pending",
+        now,
+        email,
+        None
+    ))
+
+    application_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
 
     await state.clear()
 
-    await message.answer(
-        "💗 <b>Заявка отправлена!</b>\n\n"
-        f"🆔 Номер заявки: <code>#{application_id}</code>\n\n"
-        "⏳ Теперь администрация рассмотрит её.\n\n"
-        "Если заявку примут, код вступления "
-        "будет подготовлен администрацией."
-    )
-
     username = (
-        f"@{escape(message.from_user.username)}"
+        f"@{message.from_user.username}"
         if message.from_user.username
         else "нет username"
     )
 
     admin_text = (
-        "💗 <b>НОВАЯ ЗАЯВКА В КЛАН</b>\n\n"
+        "📥 <b>Новая заявка!</b>\n\n"
         f"🆔 Заявка: <code>#{application_id}</code>\n"
         f"👤 Telegram: {username}\n"
         f"🆔 User ID: <code>{message.from_user.id}</code>\n\n"
         f"🎮 Minecraft: <b>{escape(data['nickname'])}</b>\n"
         f"📝 Причина: {escape(data['reason'])}\n"
-        f"💗 Верность: {escape(data['loyal'])}\n"
+        f"💗 Верность: <b>{escape(data['loyal'])}</b>\n"
         f"⚔️ PvP: <b>{data['pvp']}/10</b>\n"
+        f"⛏️ PvE: <b>{data['pve']}/10</b>\n"
         f"🎂 Возраст: <b>{data['age']}</b>\n"
-        f"📧 Gmail: <code>{escape(email)}</code>"
+        f"📧 Gmail: <code>{escape(email)}</code>\n\n"
+        "Выберите решение:"
     )
 
-    await bot.send_message(
-        ADMIN_ID,
-        admin_text,
-        reply_markup=admin_application_keyboard(
-            application_id
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            admin_text,
+            reply_markup=admin_application_keyboard(
+                application_id
+            )
         )
+    except Exception as e:
+        logger.error(
+            "Не удалось отправить заявку админу: %s",
+            e
+        )
+
+    await message.answer(
+        "✅ <b>Заявка отправлена!</b>\n\n"
+        "Теперь её рассмотрит администрация клана.\n"
+        "Ожидай решения 💗"
     )
 
 
 # =========================================================
-# SECRET ADMIN COMMAND
+# ADMIN
 # =========================================================
 
 @dp.message(Command("admin"))
-async def admin_command(message: Message):
-
+async def admin_handler(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
     await message.answer(
-        "👑 <b>АДМИН-ПАНЕЛЬ</b>\n\n"
-        "Добро пожаловать, главный администратор.\n\n"
-        "Выбери нужный раздел:",
+        "👑 <b>Панель администратора</b>\n\n"
+        "Выберите действие:",
         reply_markup=admin_keyboard()
     )
 
@@ -1082,69 +977,63 @@ async def admin_command(message: Message):
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
 
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute(
+    cur.execute(
         "SELECT COUNT(*) FROM applications"
     )
-    total = cursor.fetchone()[0]
+    total = cur.fetchone()[0]
 
-    cursor.execute("""
+    cur.execute("""
         SELECT COUNT(*)
         FROM applications
         WHERE status = 'pending'
     """)
-    pending = cursor.fetchone()[0]
+    pending = cur.fetchone()[0]
 
-    cursor.execute("""
+    cur.execute("""
         SELECT COUNT(*)
         FROM applications
         WHERE status = 'accepted'
     """)
-    accepted = cursor.fetchone()[0]
+    accepted = cur.fetchone()[0]
 
-    cursor.execute("""
+    cur.execute("""
         SELECT COUNT(*)
         FROM applications
         WHERE status = 'rejected'
     """)
-    rejected = cursor.fetchone()[0]
+    rejected = cur.fetchone()[0]
 
-    cursor.execute(
+    cur.execute(
         "SELECT COUNT(*) FROM users"
     )
-    users = cursor.fetchone()[0]
+    users = cur.fetchone()[0]
 
-    cursor.execute("""
+    cur.execute("""
         SELECT COUNT(*)
         FROM users
         WHERE blocked = 1
     """)
-    blocked = cursor.fetchone()[0]
+    blocked = cur.fetchone()[0]
 
-    db.close()
+    conn.close()
 
-    await callback.answer()
-
-    await callback.message.edit_text(
-        "📊 <b>СТАТИСТИКА КЛАНА</b>\n\n"
+    await callback.message.answer(
+        "📊 <b>Статистика</b>\n\n"
         f"👥 Пользователей: <b>{users}</b>\n"
         f"🚫 Заблокировано: <b>{blocked}</b>\n\n"
-        f"📋 Всего заявок: <b>{total}</b>\n"
-        f"⏳ На рассмотрении: <b>{pending}</b>\n"
+        f"📨 Всего заявок: <b>{total}</b>\n"
+        f"📥 На рассмотрении: <b>{pending}</b>\n"
         f"✅ Принято: <b>{accepted}</b>\n"
-        f"❌ Отклонено: <b>{rejected}</b>",
-        reply_markup=admin_keyboard()
+        f"❌ Отклонено: <b>{rejected}</b>"
     )
+
+    await callback.answer()
 
 
 # =========================================================
@@ -1153,45 +1042,46 @@ async def admin_stats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_pending")
 async def admin_pending(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
 
-    rows = get_pending_applications()
+    conn = get_db()
+    cur = conn.cursor()
 
-    await callback.answer()
+    cur.execute("""
+        SELECT id, user_id, nickname, pvp, pve, created_at
+        FROM applications
+        WHERE status = 'pending'
+        ORDER BY id DESC
+        LIMIT 20
+    """)
+
+    rows = cur.fetchall()
+
+    conn.close()
 
     if not rows:
-
-        await callback.message.edit_text(
-            "📥 <b>Ожидающие заявки</b>\n\n"
-            "✨ Сейчас новых заявок нет.",
-            reply_markup=admin_keyboard()
+        await callback.message.answer(
+            "📥 Новых заявок нет."
         )
-
+        await callback.answer()
         return
 
-    text = "📥 <b>ОЖИДАЮЩИЕ ЗАЯВКИ</b>\n\n"
+    text = "📥 <b>Заявки на рассмотрении</b>\n\n"
 
     for row in rows:
-
-        app_id, user_id, nickname, age, pvp, created_at = row
+        app_id, user_id, nickname, pvp, pve, created_at = row
 
         text += (
-            f"🆔 <code>#{app_id}</code> — "
-            f"<b>{escape(nickname)}</b>\n"
+            f"🆔 <code>#{app_id}</code>\n"
+            f"🎮 {escape(nickname)}\n"
+            f"⚔️ PvP: {pvp}/10 | ⛏️ PvE: {pve}/10\n"
             f"👤 ID: <code>{user_id}</code>\n"
-            f"🎂 {age} лет | ⚔️ PvP {pvp}/10\n\n"
+            f"🕐 {created_at[:16]}\n\n"
         )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
+    await callback.message.answer(text)
+    await callback.answer()
 
 
 # =========================================================
@@ -1200,57 +1090,48 @@ async def admin_pending(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "admin_recent")
 async def admin_recent(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
 
-    rows = get_recent_applications()
+    conn = get_db()
+    cur = conn.cursor()
 
-    await callback.answer()
+    cur.execute("""
+        SELECT id, nickname, status, created_at
+        FROM applications
+        ORDER BY id DESC
+        LIMIT 15
+    """)
+
+    rows = cur.fetchall()
+
+    conn.close()
 
     if not rows:
-
-        await callback.message.edit_text(
-            "🗂 Заявок пока нет.",
-            reply_markup=admin_keyboard()
+        await callback.message.answer(
+            "🗂 Заявок пока нет."
         )
-
+        await callback.answer()
         return
 
+    text = "🗂 <b>Последние заявки</b>\n\n"
+
     status_names = {
-        "pending": "⏳",
-        "accepted": "✅",
-        "rejected": "❌"
+        "pending": "📥 На рассмотрении",
+        "accepted": "✅ Принята",
+        "rejected": "❌ Отклонена"
     }
 
-    text = "🗂 <b>ПОСЛЕДНИЕ ЗАЯВКИ</b>\n\n"
-
-    for row in rows:
-
-        (
-            app_id,
-            nickname,
-            age,
-            pvp,
-            status,
-            created_at
-        ) = row
-
+    for app_id, nickname, status, created_at in rows:
         text += (
-            f"{status_names.get(status, '❔')} "
             f"<code>#{app_id}</code> "
             f"<b>{escape(nickname)}</b>\n"
-            f"🎂 {age} | ⚔️ {pvp}/10\n\n"
+            f"{status_names.get(status, status)}\n"
+            f"🕐 {created_at[:16]}\n\n"
         )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
+    await callback.message.answer(text)
+    await callback.answer()
 
 
 # =========================================================
@@ -1258,63 +1139,75 @@ async def admin_recent(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "admin_search")
-async def admin_search(
+async def admin_search_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
 
-    await callback.answer()
-
-    await state.set_state(
-        AdminSearch.waiting_application_id
-    )
+    await state.set_state(AdminSearch.application_id)
 
     await callback.message.answer(
-        "🔎 Введи номер заявки.\n\n"
+        "🔎 Введи ID заявки.\n\n"
         "Например:\n"
         "<code>15</code>"
     )
 
+    await callback.answer()
 
-@dp.message(AdminSearch.waiting_application_id)
+
+@dp.message(AdminSearch.application_id)
 async def admin_search_result(
     message: Message,
     state: FSMContext
 ):
-
     if message.from_user.id != ADMIN_ID:
+        await state.clear()
         return
 
-    try:
-        application_id = int(
-            message.text.strip()
-        )
-
-    except ValueError:
-
+    if not message.text.isdigit():
         await message.answer(
-            "❌ Введи номер заявки числом."
+            "❌ ID должен быть числом."
         )
-
         return
 
-    application = get_application(
-        application_id
-    )
+    app_id = int(message.text)
 
-    if not application:
+    conn = get_db()
+    cur = conn.cursor()
 
+    cur.execute("""
+        SELECT
+            id,
+            user_id,
+            username,
+            nickname,
+            reason,
+            loyal,
+            pvp,
+            pve,
+            age,
+            status,
+            created_at,
+            decided_at,
+            decision_message,
+            email,
+            join_code
+        FROM applications
+        WHERE id = ?
+    """, (app_id,))
+
+    row = cur.fetchone()
+
+    conn.close()
+
+    await state.clear()
+
+    if not row:
         await message.answer(
-            "❌ Такая заявка не найдена."
+            "❌ Заявка не найдена."
         )
-
         return
 
     (
@@ -1325,51 +1218,31 @@ async def admin_search_result(
         reason,
         loyal,
         pvp,
+        pve,
         age,
         status,
-        email,
-        join_code,
         created_at,
         decided_at,
-        decision_message
-    ) = application
+        decision_message,
+        email,
+        join_code
+    ) = row
 
-    text = (
-        "🔎 <b>ЗАЯВКА</b>\n\n"
-        f"🆔 Номер: <code>#{app_id}</code>\n"
-        f"👤 User ID: <code>{user_id}</code>\n"
-        f"👤 Username: "
-        f"{'@' + escape(username) if username else 'нет'}\n\n"
+    await message.answer(
+        "🔎 <b>Заявка найдена</b>\n\n"
+        f"🆔 #{app_id}\n"
+        f"👤 ID: <code>{user_id}</code>\n"
+        f"👤 Username: @{escape(username or 'нет')}\n"
         f"🎮 Minecraft: <b>{escape(nickname)}</b>\n"
         f"📝 Причина: {escape(reason)}\n"
         f"💗 Верность: {escape(loyal)}\n"
-        f"⚔️ PvP: <b>{pvp}/10</b>\n"
-        f"🎂 Возраст: <b>{age}</b>\n"
-        f"📧 Gmail: "
-        f"<code>{escape(email or 'нет')}</code>\n\n"
+        f"⚔️ PvP: {pvp}/10\n"
+        f"⛏️ PvE: {pve}/10\n"
+        f"🎂 Возраст: {age}\n"
+        f"📧 Gmail: <code>{escape(email or 'нет')}</code>\n"
+        f"🔑 Код: <code>{escape(join_code or 'ещё нет')}</code>\n"
         f"📌 Статус: <b>{escape(status)}</b>\n"
-    )
-
-    if join_code:
-        text += (
-            f"🔐 Код: <code>{escape(join_code)}</code>\n"
-        )
-
-    if decision_message:
-        text += (
-            "\n💬 Сообщение администрации:\n"
-            f"{escape(decision_message)}"
-        )
-
-    await state.clear()
-
-    await message.answer(
-        text,
-        reply_markup=(
-            admin_application_keyboard(app_id)
-            if status == "pending"
-            else admin_keyboard()
-        )
+        f"🕐 Создана: {created_at}"
     )
 
 
@@ -1379,280 +1252,194 @@ async def admin_search_result(
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
 
-    db = get_db()
-    cursor = db.cursor()
+    conn = get_db()
+    cur = conn.cursor()
 
-    cursor.execute("""
-        SELECT
-            user_id,
-            username,
-            first_name,
-            blocked
+    cur.execute("""
+        SELECT user_id, username, first_name, blocked
         FROM users
-        ORDER BY rowid DESC
-        LIMIT 20
+        ORDER BY created_at DESC
+        LIMIT 30
     """)
 
-    rows = cursor.fetchall()
+    rows = cur.fetchall()
 
-    db.close()
-
-    await callback.answer()
+    conn.close()
 
     if not rows:
-
-        await callback.message.edit_text(
-            "👥 Пользователей пока нет.",
-            reply_markup=admin_keyboard()
+        await callback.message.answer(
+            "👥 Пользователей пока нет."
         )
-
+        await callback.answer()
         return
 
-    text = "👥 <b>ПОСЛЕДНИЕ ПОЛЬЗОВАТЕЛИ</b>\n\n"
+    text = "👥 <b>Пользователи</b>\n\n"
 
-    for (
-        user_id,
-        username,
-        first_name,
-        blocked
-    ) in rows:
-
-        status = "🚫" if blocked else "🟢"
+    for user_id, username, first_name, blocked in rows:
+        status = "🚫" if blocked else "✅"
 
         text += (
             f"{status} <code>{user_id}</code> — "
-            f"{escape(first_name or '')}"
+            f"{escape(first_name or '')} "
+            f"@{escape(username or 'нет')}\n"
         )
 
-        if username:
-            text += f" (@{escape(username)})"
-
-        text += "\n"
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=admin_keyboard()
-    )
+    await callback.message.answer(text)
+    await callback.answer()
 
 
 # =========================================================
-# ADMIN BLOCK
+# BLOCK
 # =========================================================
 
 @dp.callback_query(F.data == "admin_block")
-async def admin_block_button(
+async def admin_block_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
+
+    await state.set_state(AdminBlock.user_id)
+
+    await callback.message.answer(
+        "🚫 Введи Telegram ID пользователя:"
+    )
 
     await callback.answer()
 
-    await state.set_state(
-        AdminBlock.waiting_user_id
-    )
 
-    await state.update_data(
-        action="block"
-    )
-
-    await callback.message.answer(
-        "🚫 Введи Telegram ID пользователя.\n\n"
-        "Например:\n"
-        "<code>123456789</code>"
-    )
-
-
-# =========================================================
-# ADMIN UNBLOCK
-# =========================================================
-
-@dp.callback_query(F.data == "admin_unblock")
-async def admin_unblock_button(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-        return
-
-    await callback.answer()
-
-    await state.set_state(
-        AdminBlock.waiting_user_id
-    )
-
-    await state.update_data(
-        action="unblock"
-    )
-
-    await callback.message.answer(
-        "🔓 Введи Telegram ID пользователя.\n\n"
-        "Например:\n"
-        "<code>123456789</code>"
-    )
-
-
-# =========================================================
-# ADMIN BLOCK / UNBLOCK PROCESS
-# =========================================================
-
-@dp.message(AdminBlock.waiting_user_id)
-async def process_admin_block(
+@dp.message(AdminBlock.user_id)
+async def admin_block_process(
     message: Message,
     state: FSMContext
 ):
-
     if message.from_user.id != ADMIN_ID:
+        await state.clear()
         return
 
-    try:
-        user_id = int(
-            message.text.strip()
-        )
-
-    except ValueError:
-
+    if not message.text.isdigit():
         await message.answer(
-            "❌ Неверный Telegram ID."
+            "❌ Telegram ID должен быть числом."
         )
-
         return
+
+    user_id = int(message.text)
 
     if user_id == ADMIN_ID:
-
         await message.answer(
-            "😄 Себя блокировать нельзя."
+            "❌ Нельзя заблокировать владельца."
         )
-
         await state.clear()
-
         return
 
-    data = await state.get_data()
-    action = data.get("action")
-
-    if action == "block":
-
-        set_blocked(
-            user_id,
-            True
-        )
-
-        await message.answer(
-            f"🚫 Пользователь "
-            f"<code>{user_id}</code> заблокирован."
-        )
-
-    else:
-
-        set_blocked(
-            user_id,
-            False
-        )
-
-        await message.answer(
-            f"🔓 Пользователь "
-            f"<code>{user_id}</code> разблокирован."
-        )
+    set_blocked(user_id, True)
 
     await state.clear()
 
+    await message.answer(
+        f"🚫 Пользователь <code>{user_id}</code> заблокирован."
+    )
+
 
 # =========================================================
-# ADMIN BROADCAST
+# UNBLOCK
 # =========================================================
 
-@dp.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast(
+@dp.callback_query(F.data == "admin_unblock")
+async def admin_unblock_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
-
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
         return
+
+    await state.set_state(AdminUnblock.user_id)
+
+    await callback.message.answer(
+        "🔓 Введи Telegram ID пользователя:"
+    )
 
     await callback.answer()
 
-    await state.set_state(
-        AdminBroadcast.waiting_message
-    )
 
-    await callback.message.answer(
-        "📢 <b>Рассылка</b>\n\n"
-        "Отправь текст сообщения, которое нужно "
-        "разослать пользователям.\n\n"
-        "⚠️ Рассылка уйдёт всем незаблокированным "
-        "пользователям."
-    )
-
-
-@dp.message(AdminBroadcast.waiting_message)
-async def process_broadcast(
+@dp.message(AdminUnblock.user_id)
+async def admin_unblock_process(
     message: Message,
     state: FSMContext
 ):
-
     if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+
+    if not message.text.isdigit():
+        await message.answer(
+            "❌ Telegram ID должен быть числом."
+        )
+        return
+
+    user_id = int(message.text)
+
+    set_blocked(user_id, False)
+
+    await state.clear()
+
+    await message.answer(
+        f"🔓 Пользователь <code>{user_id}</code> разблокирован."
+    )
+
+
+# =========================================================
+# BROADCAST
+# =========================================================
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(AdminBroadcast.message)
+
+    await callback.message.answer(
+        "📢 Напиши сообщение для рассылки:"
+    )
+
+    await callback.answer()
+
+
+@dp.message(AdminBroadcast.message)
+async def admin_broadcast_process(
+    message: Message,
+    state: FSMContext
+):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
         return
 
     text = message.text
-
-    if not text:
-
-        await message.answer(
-            "❌ Отправь именно текстовое сообщение."
-        )
-
-        return
 
     users = get_all_users()
 
     sent = 0
     failed = 0
 
-    await message.answer(
-        f"📢 Начинаю рассылку...\n\n"
-        f"👥 Получателей: <b>{len(users)}</b>"
-    )
-
     for user_id in users:
-
         try:
-
             await bot.send_message(
                 user_id,
                 text
             )
-
             sent += 1
 
             await asyncio.sleep(0.05)
 
         except Exception:
-
             failed += 1
 
     await state.clear()
@@ -1660,335 +1447,226 @@ async def process_broadcast(
     await message.answer(
         "📢 <b>Рассылка завершена</b>\n\n"
         f"✅ Отправлено: <b>{sent}</b>\n"
-        f"❌ Не доставлено: <b>{failed}</b>"
+        f"❌ Ошибок: <b>{failed}</b>"
     )
 
 
 # =========================================================
-# ACCEPT APPLICATION
+# ACCEPT / REJECT
 # =========================================================
 
-@dp.callback_query(F.data.startswith("accept:"))
-async def accept_application(
+@dp.callback_query(
+    F.data.regexp(r"^(accept|reject)_\d+$")
+)
+async def admin_decision_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
-
     if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-
         return
 
-    application_id = int(
-        callback.data.split(":")[1]
-    )
+    action, app_id_text = callback.data.split("_")
+    app_id = int(app_id_text)
 
-    application = get_application(
-        application_id
-    )
+    conn = get_db()
+    cur = conn.cursor()
 
-    if not application:
+    cur.execute("""
+        SELECT user_id, nickname
+        FROM applications
+        WHERE id = ?
+          AND status = 'pending'
+    """, (app_id,))
 
+    row = cur.fetchone()
+
+    conn.close()
+
+    if not row:
         await callback.answer(
-            "Заявка не найдена.",
+            "Заявка уже обработана или не найдена.",
             show_alert=True
         )
-
         return
 
-    status = application[8]
-
-    if status != "pending":
-
-        await callback.answer(
-            f"Заявка уже обработана: {status}",
-            show_alert=True
-        )
-
-        return
+    user_id, nickname = row
 
     await state.update_data(
-        application_id=application_id,
-        decision="accepted"
+        application_id=app_id,
+        decision="accepted" if action == "accept" else "rejected",
+        target_user_id=user_id,
+        nickname=nickname
     )
 
-    await state.set_state(
-        AdminDecision.waiting_message
+    await state.set_state(AdminDecision.message)
+
+    if action == "accept":
+        title = "✅ Принятие заявки"
+    else:
+        title = "❌ Отклонение заявки"
+
+    await callback.message.answer(
+        f"<b>{title}</b>\n\n"
+        f"Заявка: <code>#{app_id}</code>\n"
+        f"Игрок: <b>{escape(nickname)}</b>\n\n"
+        "Напиши сообщение, которое будет отправлено игроку."
     )
 
     await callback.answer()
-
-    await callback.message.answer(
-        "✅ <b>Заявка будет ПРИНЯТА.</b>\n\n"
-        "Напиши сообщение, которое хочешь отправить "
-        "пользователю.\n\n"
-        "После этого бот:\n"
-        "🔐 сгенерирует уникальный код;\n"
-        "📧 покажет Gmail пользователя;\n"
-        "📋 подготовит готовый текст письма."
-    )
-
-
-# =========================================================
-# REJECT APPLICATION
-# =========================================================
-
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject_application(
-    callback: CallbackQuery,
-    state: FSMContext
-):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        await callback.answer(
-            "Нет доступа.",
-            show_alert=True
-        )
-
-        return
-
-    application_id = int(
-        callback.data.split(":")[1]
-    )
-
-    application = get_application(
-        application_id
-    )
-
-    if not application:
-
-        await callback.answer(
-            "Заявка не найдена.",
-            show_alert=True
-        )
-
-        return
-
-    status = application[8]
-
-    if status != "pending":
-
-        await callback.answer(
-            f"Заявка уже обработана: {status}",
-            show_alert=True
-        )
-
-        return
-
-    await state.update_data(
-        application_id=application_id,
-        decision="rejected"
-    )
-
-    await state.set_state(
-        AdminDecision.waiting_message
-    )
-
-    await callback.answer()
-
-    await callback.message.answer(
-        "❌ <b>Заявка будет ОТКЛОНЕНА.</b>\n\n"
-        "Напиши сообщение, которое отправить пользователю.\n\n"
-        "Например:\n"
-        "К сожалению, сейчас мы не можем принять "
-        "тебя. Попробуй подать заявку снова через 2 часа."
-    )
 
 
 # =========================================================
 # ADMIN DECISION MESSAGE
 # =========================================================
 
-@dp.message(AdminDecision.waiting_message)
-async def admin_decision_message(
+@dp.message(AdminDecision.message)
+async def admin_decision_process(
     message: Message,
     state: FSMContext
 ):
-
     if message.from_user.id != ADMIN_ID:
+        await state.clear()
         return
-
-    decision_message = message.text.strip()
 
     data = await state.get_data()
 
-    application_id = data.get(
-        "application_id"
-    )
+    app_id = data["application_id"]
+    decision = data["decision"]
+    user_id = data["target_user_id"]
 
-    decision = data.get(
-        "decision"
-    )
+    decision_message = message.text.strip()
 
-    if not application_id or not decision:
+    conn = get_db()
+    cur = conn.cursor()
 
-        await state.clear()
+    now = datetime.now().isoformat()
 
-        return
-
-    application = get_application(
-        application_id
-    )
-
-    if not application:
-
-        await message.answer(
-            "❌ Заявка не найдена."
-        )
-
-        await state.clear()
-
-        return
-
-    (
-        app_id,
-        user_id,
-        username,
-        nickname,
-        reason,
-        loyal,
-        pvp,
-        age,
-        status,
-        email,
-        old_code,
-        created_at,
-        decided_at,
-        old_message
-    ) = application
-
-    if status != "pending":
-
-        await message.answer(
-            "⚠️ Эта заявка уже обработана."
-        )
-
-        await state.clear()
-
-        return
-
-    # =====================================================
-    # ACCEPT
-    # =====================================================
+    join_code = None
 
     if decision == "accepted":
-
         join_code = generate_join_code()
 
-        update_application(
-            application_id=application_id,
-            status="accepted",
-            decision_message=decision_message,
-            join_code=join_code
-        )
-
-        try:
-
-            await bot.send_message(
-                user_id,
-                "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\n"
-                "💗 Твоя заявка в клан "
-                "<b>«Крутяшки»</b> принята!\n\n"
-                f"💬 Сообщение администрации:\n"
-                f"{escape(decision_message)}\n\n"
-                "📧 Администратор отправит код вступления "
-                "на указанную тобой Gmail-почту."
-            )
-
-            user_sent = True
-
-        except Exception:
-
-            user_sent = False
-
-        email_text = (
-            "Здравствуйте! 🌸\n\n"
-            "Ваша заявка в клан «Крутяшки» была принята.\n\n"
-            f"Ваш код вступления:\n"
-            f"{join_code}\n\n"
-            "Сообщение от администрации:\n"
-            f"{decision_message}\n\n"
-            "Добро пожаловать! 💗"
-        )
-
-        await message.answer(
-            "🎉 <b>ЗАЯВКА ПРИНЯТА</b>\n\n"
-            f"🆔 Заявка: <code>#{application_id}</code>\n"
-            f"🎮 Minecraft: <b>{escape(nickname)}</b>\n\n"
-            f"📧 Gmail:\n"
-            f"<code>{escape(email or 'не указана')}</code>\n\n"
-            f"🔐 <b>КОД ВСТУПЛЕНИЯ:</b>\n"
-            f"<code>{join_code}</code>\n\n"
-            "📋 <b>ГОТОВЫЙ ТЕКСТ ПИСЬМА:</b>\n\n"
-            f"<code>{escape(email_text)}</code>\n\n"
-            + (
-                "✅ Пользователь уведомлён в Telegram."
-                if user_sent
-                else
-                "⚠️ Не удалось отправить сообщение пользователю."
-            ),
-            reply_markup=admin_keyboard()
-        )
-
-    # =====================================================
-    # REJECT
-    # =====================================================
+        cur.execute("""
+            UPDATE applications
+            SET status = ?,
+                decided_at = ?,
+                decision_message = ?,
+                join_code = ?
+            WHERE id = ?
+        """, (
+            "accepted",
+            now,
+            decision_message,
+            join_code,
+            app_id
+        ))
 
     else:
+        cur.execute("""
+            UPDATE applications
+            SET status = ?,
+                decided_at = ?,
+                decision_message = ?
+            WHERE id = ?
+        """, (
+            "rejected",
+            now,
+            decision_message,
+            app_id
+        ))
 
-        update_application(
-            application_id=application_id,
-            status="rejected",
-            decision_message=decision_message,
-            join_code=None
-        )
+    cur.execute("""
+        SELECT
+            nickname,
+            email,
+            reason,
+            loyal,
+            pvp,
+            pve,
+            age,
+            username
+        FROM applications
+        WHERE id = ?
+    """, (app_id,))
 
-        try:
+    application = cur.fetchone()
 
-            await bot.send_message(
-                user_id,
-                "💔 <b>Заявка отклонена</b>\n\n"
-                f"{escape(decision_message)}\n\n"
-                "⏰ Повторно подать заявку можно через 2 часа."
-            )
-
-            user_sent = True
-
-        except Exception:
-
-            user_sent = False
-
-        await message.answer(
-            "❌ <b>ЗАЯВКА ОТКЛОНЕНА</b>\n\n"
-            f"🆔 Заявка: <code>#{application_id}</code>\n"
-            f"🎮 Minecraft: <b>{escape(nickname)}</b>\n\n"
-            + (
-                "✅ Пользователь уведомлён."
-                if user_sent
-                else
-                "⚠️ Не удалось уведомить пользователя."
-            ),
-            reply_markup=admin_keyboard()
-        )
+    conn.commit()
+    conn.close()
 
     await state.clear()
 
+    if decision == "accepted":
+        user_text = (
+            "🎉 <b>Твоя заявка принята!</b>\n\n"
+            f"{escape(decision_message)}\n\n"
+            "💗 Добро пожаловать в клан <b>Крутяшки</b>!\n\n"
+            f"🔑 Твой код вступления:\n"
+            f"<code>{join_code}</code>\n\n"
+            "Сохрани этот код."
+        )
+
+        try:
+            await bot.send_message(
+                user_id,
+                user_text
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить пользователя: %s",
+                e
+            )
+
+        nickname, email, reason, loyal, pvp, pve, age, username = application
+
+        email_text = (
+            "📧 <b>Готовый текст для отправки на Gmail</b>\n\n"
+            f"Кому: <code>{escape(email)}</code>\n\n"
+            "Текст:\n"
+            "<code>"
+            "Здравствуйте! Вы были приняты в клан «Крутяшки».\n\n"
+            f"Ваш Minecraft ник: {escape(nickname)}\n"
+            f"Код вступления: {join_code}\n\n"
+            "Сохраните этот код."
+            "</code>"
+        )
+
+        await message.answer(
+            "✅ <b>Заявка принята.</b>\n\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Код: <code>{join_code}</code>\n\n"
+            f"{email_text}"
+        )
+
+    else:
+        try:
+            await bot.send_message(
+                user_id,
+                "❌ <b>Заявка отклонена.</b>\n\n"
+                f"{escape(decision_message)}\n\n"
+                "Повторно подать заявку можно через "
+                f"<b>{REAPPLY_COOLDOWN_HOURS} часа</b>."
+            )
+        except Exception as e:
+            logger.error(
+                "Не удалось уведомить пользователя: %s",
+                e
+            )
+
+        await message.answer(
+            f"❌ Заявка <code>#{app_id}</code> отклонена."
+        )
+
 
 # =========================================================
-# CANCEL
+# /CANCEL
 # =========================================================
 
 @dp.message(Command("cancel"))
-async def cancel_command(
+async def cancel_handler(
     message: Message,
     state: FSMContext
 ):
-
     await state.clear()
 
     await message.answer(
@@ -2001,30 +1679,32 @@ async def cancel_command(
 # =========================================================
 
 @dp.message()
-async def blocked_check(message: Message):
-
+async def blocked_handler(message: Message):
     if message.from_user.id == ADMIN_ID:
         return
 
     save_user(message)
 
     if is_blocked(message.from_user.id):
-
         await message.answer(
-            "🚫 Доступ к боту ограничен администрацией."
+            "🚫 <b>Доступ ограничен.</b>\n\n"
+            "Вы не можете использовать этого бота."
         )
 
 
 # =========================================================
-# MAIN
+# START
 # =========================================================
 
 async def main():
-
     init_db()
 
-    logging.info(
-        "Бот «Крутяшки» запущен."
+    me = await bot.get_me()
+
+    logger.info(
+        "Бот запущен: @%s | ID: %s",
+        me.username,
+        me.id
     )
 
     await dp.start_polling(bot)
