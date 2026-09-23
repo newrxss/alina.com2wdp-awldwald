@@ -3,9 +3,13 @@ import logging
 import os
 import re
 import secrets
+import random
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
+from email.message import EmailMessage
+
+import aiosmtplib
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -31,22 +35,50 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 ADMIN_ID = 1541550837
 
-# ВАЖНО:
-# Не удаляй существующую krutyashki.sqlite3.
-# Railway должен использовать эту же базу.
 DB_FILE = os.getenv("DB_FILE", "krutyashki.sqlite3")
 
 IMAGE_FILE = "alina.jpg"
 
-# Официальный канал
 OFFICIAL_CHANNEL = "https://t.me/alino4kaprincssss"
 
-# Официальный бот
 OFFICIAL_BOT = "https://t.me/krytyashki_clan_bot"
 
 ALINA_USERNAME = "@alino4ka_princes"
 
 REAPPLY_COOLDOWN_HOURS = 2
+
+
+# =========================================================
+# SMTP / GMAIL
+# =========================================================
+
+SMTP_HOST = os.getenv(
+    "SMTP_HOST",
+    "smtp-relay.brevo.com"
+)
+
+SMTP_PORT = int(
+    os.getenv("SMTP_PORT", "587")
+)
+
+SMTP_LOGIN = os.getenv(
+    "SMTP_LOGIN",
+    ""
+)
+
+SMTP_PASSWORD = os.getenv(
+    "SMTP_PASSWORD",
+    ""
+)
+
+# ВАЖНО:
+# Здесь должен быть VERIFIED sender из Brevo.
+SMTP_FROM = os.getenv(
+    "SMTP_FROM",
+    ""
+)
+
+EMAIL_CODE_EXPIRE_MINUTES = 10
 
 
 # =========================================================
@@ -92,6 +124,7 @@ class ApplicationForm(StatesGroup):
     pve = State()
     age = State()
     email = State()
+    email_code = State()
 
 
 class AdminDecision(StatesGroup):
@@ -119,20 +152,10 @@ class AdminBroadcast(StatesGroup):
 # =========================================================
 
 def get_db():
-    """
-    Подключение к существующей SQLite-базе.
-
-    Никаких DELETE / DROP / очистки здесь нет.
-    """
     return sqlite3.connect(DB_FILE)
 
 
 def init_db():
-    """
-    Создаёт таблицы только если их ещё нет.
-    Старые данные не удаляет.
-    """
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -166,10 +189,6 @@ def init_db():
         )
     """)
 
-    # -----------------------------------------------------
-    # Миграции старой БД
-    # -----------------------------------------------------
-
     cur.execute("PRAGMA table_info(applications)")
     columns = [row[1] for row in cur.fetchall()]
 
@@ -197,14 +216,6 @@ def init_db():
 # =========================================================
 
 def save_user(message: Message):
-    """
-    Добавляет/обновляет пользователя.
-
-    ВАЖНО:
-    Если пользователь уже есть — его запись не удаляется.
-    blocked тоже не сбрасывается.
-    """
-
     conn = get_db()
     cur = conn.cursor()
 
@@ -300,10 +311,6 @@ def get_all_users():
 # =========================================================
 
 def create_database_backup():
-    """
-    Создаёт консистентную копию SQLite через Backup API.
-    """
-
     if not os.path.exists(DB_FILE):
         return None
 
@@ -322,9 +329,6 @@ def create_database_backup():
 
 
 def get_database_info():
-    """
-    Получает статистику текущей базы.
-    """
 
     if not os.path.exists(DB_FILE):
         return {
@@ -484,6 +488,62 @@ def generate_join_code():
     )
 
     return f"KRUT-{part1}-{part2}"
+
+
+# =========================================================
+# EMAIL VERIFICATION
+# =========================================================
+
+async def send_email_verification_code(
+    email: str,
+    code: str
+):
+    if not SMTP_LOGIN:
+        raise RuntimeError(
+            "SMTP_LOGIN не указан в Railway Variables."
+        )
+
+    if not SMTP_PASSWORD:
+        raise RuntimeError(
+            "SMTP_PASSWORD не указан в Railway Variables."
+        )
+
+    if not SMTP_FROM:
+        raise RuntimeError(
+            "SMTP_FROM не указан в Railway Variables."
+        )
+
+    msg = EmailMessage()
+
+    msg["From"] = SMTP_FROM
+    msg["To"] = email
+    msg["Subject"] = "Подтверждение Gmail — Крутяшки"
+
+    msg.set_content(
+        f"""Здравствуйте!
+
+Вы указали этот Gmail при подаче заявки в клан «Крутяшки».
+
+Ваш код подтверждения:
+
+{code}
+
+Код действует {EMAIL_CODE_EXPIRE_MINUTES} минут.
+
+Если вы не подавали заявку, просто проигнорируйте это письмо.
+
+Клан «Крутяшки»
+"""
+    )
+
+    await aiosmtplib.send(
+        msg,
+        hostname=SMTP_HOST,
+        port=SMTP_PORT,
+        username=SMTP_LOGIN,
+        password=SMTP_PASSWORD,
+        start_tls=True
+    )
 
 
 # =========================================================
@@ -1109,12 +1169,140 @@ async def email_handler(
         )
         return
 
+    if not SMTP_LOGIN or not SMTP_PASSWORD or not SMTP_FROM:
+        logger.error(
+            "SMTP настроен не полностью."
+        )
+
+        await message.answer(
+            "❌ Система подтверждения Gmail сейчас "
+            "не настроена администрацией.\n\n"
+            "Попробуй позже."
+        )
+        return
+
+    code = str(
+        random.randint(100000, 999999)
+    )
+
+    try:
+        await send_email_verification_code(
+            email,
+            code
+        )
+
+    except Exception as e:
+        logger.exception(
+            "Ошибка отправки Gmail-кода: %s",
+            e
+        )
+
+        await message.answer(
+            "❌ Не удалось отправить код на этот Gmail.\n\n"
+            "Проверь адрес и попробуй ещё раз.\n\n"
+            "Если проблема повторяется — сообщи администрации."
+        )
+        return
+
+    await state.update_data(
+        verification_email=email,
+        verification_code=code,
+        verification_created_at=datetime.now().isoformat()
+    )
+
+    await state.set_state(
+        ApplicationForm.email_code
+    )
+
+    await message.answer(
+        "📨 <b>Код отправлен!</b>\n\n"
+        f"Мы отправили 6-значный код на:\n"
+        f"<code>{escape(email)}</code>\n\n"
+        "Введи код из письма сюда.\n\n"
+        f"⏱ Код действует {EMAIL_CODE_EXPIRE_MINUTES} минут."
+    )
+
+
+# =========================================================
+# EMAIL CODE
+# =========================================================
+
+@dp.message(ApplicationForm.email_code)
+async def email_code_handler(
+    message: Message,
+    state: FSMContext
+):
+    code = message.text.strip()
+
+    if not re.fullmatch(r"\d{6}", code):
+        await message.answer(
+            "❌ Код должен состоять из 6 цифр.\n\n"
+            "Попробуй ещё раз:"
+        )
+        return
+
     data = await state.get_data()
+
+    saved_code = data.get(
+        "verification_code"
+    )
+
+    created_at_text = data.get(
+        "verification_created_at"
+    )
+
+    email = data.get(
+        "verification_email"
+    )
+
+    if not saved_code or not created_at_text or not email:
+        await state.clear()
+
+        await message.answer(
+            "❌ Сессия подтверждения истекла.\n\n"
+            "Начни подачу заявки заново."
+        )
+        return
+
+    try:
+        created_at = datetime.fromisoformat(
+            created_at_text
+        )
+    except Exception:
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка проверки кода.\n\n"
+            "Начни заявку заново."
+        )
+        return
+
+    if datetime.now() > created_at + timedelta(
+        minutes=EMAIL_CODE_EXPIRE_MINUTES
+    ):
+        await state.clear()
+
+        await message.answer(
+            "⌛ <b>Код истёк.</b>\n\n"
+            "Начни заявку заново, чтобы получить новый код."
+        )
+        return
+
+    if code != saved_code:
+        await message.answer(
+            "❌ Неверный код.\n\n"
+            "Проверь письмо и введи код ещё раз."
+        )
+        return
+
+    # =====================================================
+    # GMAIL ПОДТВЕРЖДЁН
+    # =====================================================
+
+    now = datetime.now().isoformat()
 
     conn = get_db()
     cur = conn.cursor()
-
-    now = datetime.now().isoformat()
 
     cur.execute("""
         INSERT INTO applications (
@@ -1171,7 +1359,8 @@ async def email_handler(
         f"⚔️ PvP: <b>{data['pvp']}/10</b>\n"
         f"⛏️ PvE: <b>{data['pve']}/10</b>\n"
         f"🎂 Возраст: <b>{data['age']}</b>\n"
-        f"📧 Gmail: <code>{escape(email)}</code>\n\n"
+        f"📧 Gmail: <code>{escape(email)}</code>\n"
+        "✅ Gmail подтверждён\n\n"
         "Выберите решение:"
     )
 
@@ -1183,6 +1372,7 @@ async def email_handler(
                 application_id
             )
         )
+
     except Exception as e:
         logger.error(
             "Не удалось отправить заявку админу: %s",
@@ -1190,7 +1380,8 @@ async def email_handler(
         )
 
     await message.answer(
-        "✅ <b>Заявка отправлена!</b>\n\n"
+        "✅ <b>Gmail подтверждён!</b>\n\n"
+        "📥 <b>Заявка отправлена администрации.</b>\n\n"
         "Теперь её рассмотрит администрация клана.\n"
         "Ожидай решения 💗"
     )
@@ -1934,6 +2125,7 @@ async def admin_decision_process(
     await state.clear()
 
     if decision == "accepted":
+
         user_text = (
             "🎉 <b>Твоя заявка принята!</b>\n\n"
             f"{escape(decision_message)}\n\n"
@@ -1985,6 +2177,7 @@ async def admin_decision_process(
         )
 
     else:
+
         try:
             await bot.send_message(
                 user_id,
