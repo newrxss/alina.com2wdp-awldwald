@@ -7,9 +7,8 @@ import random
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
-from email.message import EmailMessage
 
-import aiosmtplib
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
@@ -47,34 +46,26 @@ REAPPLY_COOLDOWN_HOURS = 2
 
 
 # =========================================================
-# SMTP / GMAIL
+# BREVO API / GMAIL
 # =========================================================
 
-SMTP_HOST = os.getenv(
-    "SMTP_HOST",
-    "smtp-relay.brevo.com"
-)
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
 
-SMTP_PORT = int(
-    os.getenv("SMTP_PORT", "587")
-)
-
-SMTP_LOGIN = os.getenv(
-    "SMTP_LOGIN",
+BREVO_FROM_EMAIL = os.getenv(
+    "BREVO_FROM_EMAIL",
     ""
-)
+).strip()
 
-SMTP_PASSWORD = os.getenv(
-    "SMTP_PASSWORD",
-    ""
-)
+BREVO_FROM_NAME = os.getenv(
+    "BREVO_FROM_NAME",
+    "Крутяшки"
+).strip()
 
-SMTP_FROM = os.getenv(
-    "SMTP_FROM",
-    ""
-)
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 EMAIL_CODE_EXPIRE_MINUTES = 10
+
+EMAIL_REQUEST_TIMEOUT = 15
 
 
 # =========================================================
@@ -463,36 +454,37 @@ def generate_join_code():
 
 
 # =========================================================
-# EMAIL VERIFICATION
+# EMAIL VERIFICATION — BREVO HTTPS API
 # =========================================================
 
 async def send_email_verification_code(
     email: str,
     code: str
 ):
-    if not SMTP_LOGIN:
+    """
+    Отправляет код подтверждения через Brevo HTTPS API.
+
+    Railway -> HTTPS -> Brevo -> Gmail
+
+    SMTP больше не используется.
+    """
+
+    if not BREVO_API_KEY:
         raise RuntimeError(
-            "SMTP_LOGIN не указан в Railway Variables."
+            "BREVO_API_KEY не указан в Railway Variables."
         )
 
-    if not SMTP_PASSWORD:
+    if not BREVO_FROM_EMAIL:
         raise RuntimeError(
-            "SMTP_PASSWORD не указан в Railway Variables."
+            "BREVO_FROM_EMAIL не указан в Railway Variables."
         )
 
-    if not SMTP_FROM:
+    if not BREVO_FROM_NAME:
         raise RuntimeError(
-            "SMTP_FROM не указан в Railway Variables."
+            "BREVO_FROM_NAME не указан в Railway Variables."
         )
 
-    msg = EmailMessage()
-
-    msg["From"] = SMTP_FROM
-    msg["To"] = email
-    msg["Subject"] = "Подтверждение Gmail — Крутяшки"
-
-    msg.set_content(
-        f"""Здравствуйте!
+    text_content = f"""Здравствуйте!
 
 Вы указали этот Gmail при подаче заявки в клан «Крутяшки».
 
@@ -506,74 +498,129 @@ async def send_email_verification_code(
 
 Клан «Крутяшки»
 """
+
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Подтверждение Gmail — Крутяшки</title>
+</head>
+<body>
+    <h2>Здравствуйте!</h2>
+
+    <p>
+        Вы указали этот Gmail при подаче заявки
+        в клан «Крутяшки».
+    </p>
+
+    <p>Ваш код подтверждения:</p>
+
+    <h1>{escape(code)}</h1>
+
+    <p>
+        Код действует
+        <b>{EMAIL_CODE_EXPIRE_MINUTES} минут</b>.
+    </p>
+
+    <p>
+        Если вы не подавали заявку,
+        просто проигнорируйте это письмо.
+    </p>
+
+    <p>
+        Клан «Крутяшки»
+    </p>
+</body>
+</html>
+"""
+
+    payload = {
+        "sender": {
+            "name": BREVO_FROM_NAME,
+            "email": BREVO_FROM_EMAIL
+        },
+        "to": [
+            {
+                "email": email
+            }
+        ],
+        "subject": "Подтверждение Gmail — Крутяшки",
+        "textContent": text_content,
+        "htmlContent": html_content
+    }
+
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json"
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=EMAIL_REQUEST_TIMEOUT
     )
 
-    # -----------------------------------------------------
-    # ПОРТ 587
-    # -----------------------------------------------------
+    logger.info(
+        "Brevo API: отправка кода на %s",
+        email
+    )
 
     try:
-        logger.info(
-            "SMTP: подключение к %s:587",
-            SMTP_HOST
-        )
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
 
-        await aiosmtplib.send(
-            msg,
-            hostname=SMTP_HOST,
-            port=587,
-            username=SMTP_LOGIN,
-            password=SMTP_PASSWORD,
-            start_tls=True,
-            timeout=15
-        )
+            async with session.post(
+                BREVO_API_URL,
+                headers=headers,
+                json=payload
+            ) as response:
 
-        logger.info(
-            "SMTP: письмо отправлено через порт 587"
-        )
+                response_text = await response.text()
 
-        return
+                if response.status not in (200, 201, 202):
+                    logger.error(
+                        "Brevo API ошибка | HTTP %s | %s",
+                        response.status,
+                        response_text[:1000]
+                    )
 
-    except Exception as error_587:
-        logger.warning(
-            "SMTP: порт 587 не сработал: %s",
-            error_587
-        )
+                    raise RuntimeError(
+                        f"Brevo API вернул HTTP {response.status}."
+                    )
 
-    # -----------------------------------------------------
-    # ПОРТ 2525
-    # -----------------------------------------------------
+                try:
+                    response_json = await response.json()
+                except Exception:
+                    response_json = {}
 
-    try:
-        logger.info(
-            "SMTP: пробуем резервный порт 2525"
-        )
+                message_id = response_json.get(
+                    "messageId",
+                    "unknown"
+                )
 
-        await aiosmtplib.send(
-            msg,
-            hostname=SMTP_HOST,
-            port=2525,
-            username=SMTP_LOGIN,
-            password=SMTP_PASSWORD,
-            start_tls=True,
-            timeout=15
-        )
+                logger.info(
+                    "Brevo API: письмо отправлено | messageId=%s",
+                    message_id
+                )
 
-        logger.info(
-            "SMTP: письмо отправлено через порт 2525"
-        )
-
-        return
-
-    except Exception as error_2525:
+    except asyncio.TimeoutError as error:
         logger.exception(
-            "SMTP: не удалось подключиться ни через 587, "
-            "ни через 2525"
+            "Brevo API: таймаут при отправке Gmail-кода"
         )
 
         raise RuntimeError(
-            "Brevo SMTP недоступен через порты 587 и 2525."
-        ) from error_2525
+            "Brevo API не ответил вовремя."
+        ) from error
+
+    except aiohttp.ClientError as error:
+        logger.exception(
+            "Brevo API: ошибка HTTPS-соединения"
+        )
+
+        raise RuntimeError(
+            "Не удалось подключиться к Brevo API."
+        ) from error
 
 
 # =========================================================
@@ -787,7 +834,9 @@ async def start_handler(
         except Exception:
             pass
 
-        await asyncio.sleep(5 / len(loading_frames))
+        await asyncio.sleep(
+            5 / len(loading_frames)
+        )
 
     text = (
         "💗 <b>Добро пожаловать!</b>\n\n"
@@ -832,7 +881,9 @@ async def start_handler(
 # =========================================================
 
 @dp.callback_query(F.data == "official_bot")
-async def official_bot_handler(callback: CallbackQuery):
+async def official_bot_handler(
+    callback: CallbackQuery
+):
     text = (
         "🔐 <b>Проверка официальности</b>\n\n"
         "✅ Вы находитесь в официальном боте "
@@ -865,7 +916,9 @@ async def official_bot_handler(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "back_main")
-async def back_main_handler(callback: CallbackQuery):
+async def back_main_handler(
+    callback: CallbackQuery
+):
     text = (
         "💗 <b>Добро пожаловать!</b>\n\n"
         "Это официальный бот клана <b>Крутяшки</b>.\n\n"
@@ -893,7 +946,9 @@ async def back_main_handler(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "about")
-async def about_handler(callback: CallbackQuery):
+async def about_handler(
+    callback: CallbackQuery
+):
     text = (
         "👑 <b>Обо мне</b>\n\n"
         "Я — бот-помощник клана <b>Крутяшки</b>.\n\n"
@@ -959,7 +1014,9 @@ async def join_handler(
 
     if last_rejected:
         try:
-            rejected_time = datetime.fromisoformat(last_rejected)
+            rejected_time = datetime.fromisoformat(
+                last_rejected
+            )
 
             if datetime.now() < rejected_time + timedelta(
                 hours=REAPPLY_COOLDOWN_HOURS
@@ -985,7 +1042,9 @@ async def join_handler(
         except Exception:
             pass
 
-    await state.set_state(ApplicationForm.nickname)
+    await state.set_state(
+        ApplicationForm.nickname
+    )
 
     await callback.message.answer(
         "💗 <b>Заявка на вступление</b>\n\n"
@@ -1006,7 +1065,9 @@ async def nickname_handler(
     state: FSMContext
 ):
     if is_blocked(message.from_user.id):
-        await message.answer("🚫 Доступ ограничен.")
+        await message.answer(
+            "🚫 Доступ ограничен."
+        )
         await state.clear()
         return
 
@@ -1019,8 +1080,13 @@ async def nickname_handler(
         )
         return
 
-    await state.update_data(nickname=nickname)
-    await state.set_state(ApplicationForm.reason)
+    await state.update_data(
+        nickname=nickname
+    )
+
+    await state.set_state(
+        ApplicationForm.reason
+    )
 
     await message.answer(
         "📝 <b>Шаг 2 из 7</b>\n\n"
@@ -1045,8 +1111,13 @@ async def reason_handler(
         )
         return
 
-    await state.update_data(reason=reason)
-    await state.set_state(ApplicationForm.loyal)
+    await state.update_data(
+        reason=reason
+    )
+
+    await state.set_state(
+        ApplicationForm.loyal
+    )
 
     await message.answer(
         "💗 <b>Шаг 3 из 7</b>\n\n"
@@ -1067,10 +1138,19 @@ async def loyal_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
-    loyal = "Да" if callback.data == "loyal_yes" else "Нет"
+    loyal = (
+        "Да"
+        if callback.data == "loyal_yes"
+        else "Нет"
+    )
 
-    await state.update_data(loyal=loyal)
-    await state.set_state(ApplicationForm.pvp)
+    await state.update_data(
+        loyal=loyal
+    )
+
+    await state.set_state(
+        ApplicationForm.pvp
+    )
 
     await callback.message.answer(
         "⚔️ <b>Шаг 4 из 7</b>\n\n"
@@ -1095,10 +1175,17 @@ async def pvp_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
-    pvp = int(callback.data.split("_")[1])
+    pvp = int(
+        callback.data.split("_")[1]
+    )
 
-    await state.update_data(pvp=pvp)
-    await state.set_state(ApplicationForm.pve)
+    await state.update_data(
+        pvp=pvp
+    )
+
+    await state.set_state(
+        ApplicationForm.pve
+    )
 
     await callback.message.answer(
         "⛏️ <b>Шаг 5 из 7</b>\n\n"
@@ -1123,10 +1210,17 @@ async def pve_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
-    pve = int(callback.data.split("_")[1])
+    pve = int(
+        callback.data.split("_")[1]
+    )
 
-    await state.update_data(pve=pve)
-    await state.set_state(ApplicationForm.age)
+    await state.update_data(
+        pve=pve
+    )
+
+    await state.set_state(
+        ApplicationForm.age
+    )
 
     await callback.message.answer(
         "🎂 <b>Шаг 6 из 7</b>\n\n"
@@ -1161,8 +1255,13 @@ async def age_handler(
         )
         return
 
-    await state.update_data(age=age)
-    await state.set_state(ApplicationForm.email)
+    await state.update_data(
+        age=age
+    )
+
+    await state.set_state(
+        ApplicationForm.email
+    )
 
     await message.answer(
         "📧 <b>Шаг 7 из 7</b>\n\n"
@@ -1181,7 +1280,9 @@ async def email_handler(
     message: Message,
     state: FSMContext
 ):
-    email = (message.text or "").strip().lower()
+    email = (
+        message.text or ""
+    ).strip().lower()
 
     if not re.fullmatch(
         r"[a-zA-Z0-9._%+-]+@gmail\.com",
@@ -1194,13 +1295,25 @@ async def email_handler(
         )
         return
 
-    if not SMTP_LOGIN or not SMTP_PASSWORD or not SMTP_FROM:
+    if not BREVO_API_KEY:
         logger.error(
-            "SMTP настроен не полностью."
+            "BREVO_API_KEY не настроен."
         )
 
         await message.answer(
             "❌ Система подтверждения Gmail сейчас "
+            "не настроена администрацией.\n\n"
+            "Попробуй позже."
+        )
+        return
+
+    if not BREVO_FROM_EMAIL:
+        logger.error(
+            "BREVO_FROM_EMAIL не настроен."
+        )
+
+        await message.answer(
+            "❌ Система отправки Gmail сейчас "
             "не настроена администрацией.\n\n"
             "Попробуй позже."
         )
@@ -1231,7 +1344,8 @@ async def email_handler(
             await status_message.edit_text(
                 "❌ <b>Не удалось отправить код.</b>\n\n"
                 "Проверь Gmail и попробуй ещё раз.\n\n"
-                "Если проблема повторяется — сообщи администрации."
+                "Если проблема повторяется — "
+                "сообщи администрации."
             )
         except Exception:
             await message.answer(
@@ -1254,7 +1368,7 @@ async def email_handler(
     try:
         await status_message.edit_text(
             "📨 <b>Код отправлен!</b>\n\n"
-            f"Мы отправили 6-значный код на:\n"
+            "Мы отправили 6-значный код на:\n"
             f"<code>{escape(email)}</code>\n\n"
             "Введи код из письма сюда.\n\n"
             f"⏱ Код действует "
@@ -1263,7 +1377,7 @@ async def email_handler(
     except Exception:
         await message.answer(
             "📨 <b>Код отправлен!</b>\n\n"
-            f"Введи код из письма.\n\n"
+            "Введи код из письма.\n\n"
             f"⏱ Код действует "
             f"{EMAIL_CODE_EXPIRE_MINUTES} минут."
         )
@@ -1289,11 +1403,23 @@ async def email_code_handler(
 
     data = await state.get_data()
 
-    saved_code = data.get("verification_code")
-    created_at_text = data.get("verification_created_at")
-    email = data.get("verification_email")
+    saved_code = data.get(
+        "verification_code"
+    )
 
-    if not saved_code or not created_at_text or not email:
+    created_at_text = data.get(
+        "verification_created_at"
+    )
+
+    email = data.get(
+        "verification_email"
+    )
+
+    if (
+        not saved_code
+        or not created_at_text
+        or not email
+    ):
         await state.clear()
 
         await message.answer(
@@ -1306,6 +1432,7 @@ async def email_code_handler(
         created_at = datetime.fromisoformat(
             created_at_text
         )
+
     except Exception:
         await state.clear()
 
@@ -1426,7 +1553,9 @@ async def email_code_handler(
 # =========================================================
 
 @dp.message(Command("admin"))
-async def admin_handler(message: Message):
+async def admin_handler(
+    message: Message
+):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1438,7 +1567,9 @@ async def admin_handler(message: Message):
 
 
 @dp.message(Command("dbinfo"))
-async def dbinfo_handler(message: Message):
+async def dbinfo_handler(
+    message: Message
+):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1467,7 +1598,9 @@ async def dbinfo_handler(message: Message):
 
 
 @dp.message(Command("backupdb"))
-async def backupdb_handler(message: Message):
+async def backupdb_handler(
+    message: Message
+):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1478,7 +1611,10 @@ async def backupdb_handler(message: Message):
     try:
         backup_file = create_database_backup()
 
-        if not backup_file or not os.path.exists(backup_file):
+        if (
+            not backup_file
+            or not os.path.exists(backup_file)
+        ):
             await message.answer(
                 "❌ Не удалось создать резервную копию."
             )
@@ -1518,14 +1654,18 @@ async def backupdb_handler(message: Message):
 # =========================================================
 
 @dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
+async def admin_stats(
+    callback: CallbackQuery
+):
     if callback.from_user.id != ADMIN_ID:
         return
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM applications")
+    cur.execute(
+        "SELECT COUNT(*) FROM applications"
+    )
     total = cur.fetchone()[0]
 
     cur.execute("""
@@ -1546,7 +1686,9 @@ async def admin_stats(callback: CallbackQuery):
     """)
     rejected = cur.fetchone()[0]
 
-    cur.execute("SELECT COUNT(*) FROM users")
+    cur.execute(
+        "SELECT COUNT(*) FROM users"
+    )
     users = cur.fetchone()[0]
 
     cur.execute("""
@@ -1575,7 +1717,9 @@ async def admin_stats(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "admin_pending")
-async def admin_pending(callback: CallbackQuery):
+async def admin_pending(
+    callback: CallbackQuery
+):
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1603,7 +1747,14 @@ async def admin_pending(callback: CallbackQuery):
     text = "📥 <b>Заявки на рассмотрении</b>\n\n"
 
     for row in rows:
-        app_id, user_id, nickname, pvp, pve, created_at = row
+        (
+            app_id,
+            user_id,
+            nickname,
+            pvp,
+            pve,
+            created_at
+        ) = row
 
         text += (
             f"🆔 <code>#{app_id}</code>\n"
@@ -1622,7 +1773,9 @@ async def admin_pending(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "admin_recent")
-async def admin_recent(callback: CallbackQuery):
+async def admin_recent(
+    callback: CallbackQuery
+):
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1654,7 +1807,13 @@ async def admin_recent(callback: CallbackQuery):
         "rejected": "❌ Отклонена"
     }
 
-    for app_id, nickname, status, created_at in rows:
+    for (
+        app_id,
+        nickname,
+        status,
+        created_at
+    ) in rows:
+
         text += (
             f"<code>#{app_id}</code> "
             f"<b>{escape(nickname)}</b>\n"
@@ -1678,7 +1837,9 @@ async def admin_search_start(
     if callback.from_user.id != ADMIN_ID:
         return
 
-    await state.set_state(AdminSearch.application_id)
+    await state.set_state(
+        AdminSearch.application_id
+    )
 
     await callback.message.answer(
         "🔎 Введи ID заявки.\n\n"
@@ -1784,7 +1945,9 @@ async def admin_search_result(
 # =========================================================
 
 @dp.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery):
+async def admin_users(
+    callback: CallbackQuery
+):
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1810,7 +1973,13 @@ async def admin_users(callback: CallbackQuery):
 
     text = "👥 <b>Пользователи</b>\n\n"
 
-    for user_id, username, first_name, blocked in rows:
+    for (
+        user_id,
+        username,
+        first_name,
+        blocked
+    ) in rows:
+
         status = "🚫" if blocked else "✅"
 
         text += (
@@ -1835,7 +2004,9 @@ async def admin_block_start(
     if callback.from_user.id != ADMIN_ID:
         return
 
-    await state.set_state(AdminBlock.user_id)
+    await state.set_state(
+        AdminBlock.user_id
+    )
 
     await callback.message.answer(
         "🚫 Введи Telegram ID пользователя:"
@@ -1870,7 +2041,10 @@ async def admin_block_process(
         await state.clear()
         return
 
-    set_blocked(user_id, True)
+    set_blocked(
+        user_id,
+        True
+    )
 
     await state.clear()
 
@@ -1891,7 +2065,9 @@ async def admin_unblock_start(
     if callback.from_user.id != ADMIN_ID:
         return
 
-    await state.set_state(AdminUnblock.user_id)
+    await state.set_state(
+        AdminUnblock.user_id
+    )
 
     await callback.message.answer(
         "🔓 Введи Telegram ID пользователя:"
@@ -1919,7 +2095,10 @@ async def admin_unblock_process(
 
     user_id = int(text)
 
-    set_blocked(user_id, False)
+    set_blocked(
+        user_id,
+        False
+    )
 
     await state.clear()
 
@@ -1940,7 +2119,9 @@ async def admin_broadcast_start(
     if callback.from_user.id != ADMIN_ID:
         return
 
-    await state.set_state(AdminBroadcast.message)
+    await state.set_state(
+        AdminBroadcast.message
+    )
 
     await callback.message.answer(
         "📢 Напиши сообщение для рассылки:"
@@ -1979,6 +2160,7 @@ async def admin_broadcast_process(
             )
 
             sent += 1
+
             await asyncio.sleep(0.05)
 
         except Exception as e:
@@ -2014,7 +2196,10 @@ async def admin_decision_start(
     if callback.from_user.id != ADMIN_ID:
         return
 
-    action, app_id_text = callback.data.split("_")
+    action, app_id_text = (
+        callback.data.split("_")
+    )
+
     app_id = int(app_id_text)
 
     conn = get_db()
@@ -2050,7 +2235,9 @@ async def admin_decision_start(
         nickname=nickname
     )
 
-    await state.set_state(AdminDecision.message)
+    await state.set_state(
+        AdminDecision.message
+    )
 
     title = (
         "✅ Принятие заявки"
@@ -2081,7 +2268,9 @@ async def admin_decision_process(
         await state.clear()
         return
 
-    decision_message = (message.text or "").strip()
+    decision_message = (
+        message.text or ""
+    ).strip()
 
     if not decision_message:
         await message.answer(
@@ -2102,6 +2291,7 @@ async def admin_decision_process(
     join_code = None
 
     if decision == "accepted":
+
         join_code = generate_join_code()
 
         cur.execute("""
@@ -2120,6 +2310,7 @@ async def admin_decision_process(
         ))
 
     else:
+
         cur.execute("""
             UPDATE applications
             SET status = ?,
@@ -2170,6 +2361,7 @@ async def admin_decision_process(
                 user_id,
                 user_text
             )
+
         except Exception as e:
             logger.error(
                 "Не удалось уведомить пользователя: %s",
@@ -2216,6 +2408,7 @@ async def admin_decision_process(
                 "Повторно подать заявку можно через "
                 f"<b>{REAPPLY_COOLDOWN_HOURS} часа</b>."
             )
+
         except Exception as e:
             logger.error(
                 "Не удалось уведомить пользователя: %s",
@@ -2248,7 +2441,9 @@ async def cancel_handler(
 # =========================================================
 
 @dp.message()
-async def blocked_handler(message: Message):
+async def blocked_handler(
+    message: Message
+):
     if message.from_user.id == ADMIN_ID:
         return
 
@@ -2289,9 +2484,15 @@ async def main():
         info["applications"]
     )
 
+    logger.info(
+        "Brevo API: %s",
+        "настроен"
+        if BREVO_API_KEY and BREVO_FROM_EMAIL
+        else "НЕ НАСТРОЕН"
+    )
+
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-      
