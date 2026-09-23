@@ -31,10 +31,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 ADMIN_ID = 1541550837
 
-DB_FILE = "krutyashki.sqlite3"
+# ВАЖНО:
+# Не удаляй существующую krutyashki.sqlite3.
+# Railway должен использовать эту же базу.
+DB_FILE = os.getenv("DB_FILE", "krutyashki.sqlite3")
+
 IMAGE_FILE = "alina.jpg"
 
-OFFICIAL_CHANNEL = "https://t.me/+eOQvGXnjFNc3Mzkx"
+# Официальный канал
+OFFICIAL_CHANNEL = "https://t.me/alino4kaprincssss"
+
+# Официальный бот
+OFFICIAL_BOT = "https://t.me/krytyashki_clan_bot"
+
 ALINA_USERNAME = "@alino4ka_princes"
 
 REAPPLY_COOLDOWN_HOURS = 2
@@ -57,7 +66,9 @@ logger = logging.getLogger(__name__)
 # =========================================================
 
 if not BOT_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN в переменных окружения Railway.")
+    raise RuntimeError(
+        "Не найден BOT_TOKEN в переменных окружения Railway."
+    )
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -108,10 +119,20 @@ class AdminBroadcast(StatesGroup):
 # =========================================================
 
 def get_db():
+    """
+    Подключение к существующей SQLite-базе.
+
+    Никаких DELETE / DROP / очистки здесь нет.
+    """
     return sqlite3.connect(DB_FILE)
 
 
 def init_db():
+    """
+    Создаёт таблицы только если их ещё нет.
+    Старые данные не удаляет.
+    """
+
     conn = get_db()
     cur = conn.cursor()
 
@@ -153,13 +174,19 @@ def init_db():
     columns = [row[1] for row in cur.fetchall()]
 
     if "pve" not in columns:
-        cur.execute("ALTER TABLE applications ADD COLUMN pve INTEGER")
+        cur.execute(
+            "ALTER TABLE applications ADD COLUMN pve INTEGER"
+        )
 
     if "email" not in columns:
-        cur.execute("ALTER TABLE applications ADD COLUMN email TEXT")
+        cur.execute(
+            "ALTER TABLE applications ADD COLUMN email TEXT"
+        )
 
     if "join_code" not in columns:
-        cur.execute("ALTER TABLE applications ADD COLUMN join_code TEXT")
+        cur.execute(
+            "ALTER TABLE applications ADD COLUMN join_code TEXT"
+        )
 
     conn.commit()
     conn.close()
@@ -170,6 +197,14 @@ def init_db():
 # =========================================================
 
 def save_user(message: Message):
+    """
+    Добавляет/обновляет пользователя.
+
+    ВАЖНО:
+    Если пользователь уже есть — его запись не удаляется.
+    blocked тоже не сбрасывается.
+    """
+
     conn = get_db()
     cur = conn.cursor()
 
@@ -184,6 +219,7 @@ def save_user(message: Message):
             blocked
         )
         VALUES (?, ?, ?, ?, 0)
+
         ON CONFLICT(user_id)
         DO UPDATE SET
             username = excluded.username,
@@ -228,8 +264,10 @@ def set_blocked(user_id: int, value: bool):
             blocked
         )
         VALUES (?, '', '', ?, ?)
+
         ON CONFLICT(user_id)
-        DO UPDATE SET blocked = excluded.blocked
+        DO UPDATE SET
+            blocked = excluded.blocked
     """, (
         user_id,
         datetime.now().isoformat(),
@@ -255,6 +293,100 @@ def get_all_users():
     conn.close()
 
     return [row[0] for row in rows]
+
+
+# =========================================================
+# DATABASE BACKUP
+# =========================================================
+
+def create_database_backup():
+    """
+    Создаёт консистентную копию SQLite через Backup API.
+    """
+
+    if not os.path.exists(DB_FILE):
+        return None
+
+    backup_file = "krutyashki_backup.sqlite3"
+
+    source = sqlite3.connect(DB_FILE)
+    destination = sqlite3.connect(backup_file)
+
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+
+    return backup_file
+
+
+def get_database_info():
+    """
+    Получает статистику текущей базы.
+    """
+
+    if not os.path.exists(DB_FILE):
+        return {
+            "exists": False,
+            "users": 0,
+            "applications": 0,
+            "blocked": 0,
+            "pending": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "size": 0,
+        }
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM users
+        WHERE blocked = 1
+    """)
+    blocked = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM applications")
+    applications = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM applications
+        WHERE status = 'pending'
+    """)
+    pending = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM applications
+        WHERE status = 'accepted'
+    """)
+    accepted = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM applications
+        WHERE status = 'rejected'
+    """)
+    rejected = cur.fetchone()[0]
+
+    conn.close()
+
+    return {
+        "exists": True,
+        "users": users,
+        "applications": applications,
+        "blocked": blocked,
+        "pending": pending,
+        "accepted": accepted,
+        "rejected": rejected,
+        "size": os.path.getsize(DB_FILE),
+    }
 
 
 # =========================================================
@@ -375,8 +507,39 @@ def main_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="🔐 Проверить официальный бот",
+                    callback_data="official_bot"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📢 Официальный канал",
                     url=OFFICIAL_CHANNEL
+                )
+            ]
+        ]
+    )
+
+
+def official_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🤖 Официальный бот",
+                    url=OFFICIAL_BOT
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 Официальный канал",
+                    url=OFFICIAL_CHANNEL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="back_main"
                 )
             ]
         ]
@@ -494,7 +657,10 @@ def admin_keyboard():
 # =========================================================
 
 @dp.message(CommandStart())
-async def start_handler(message: Message, state: FSMContext):
+async def start_handler(
+    message: Message,
+    state: FSMContext
+):
     await state.clear()
 
     save_user(message)
@@ -506,20 +672,12 @@ async def start_handler(message: Message, state: FSMContext):
         )
         return
 
-    # -----------------------------------------------------
-    # Первый экран — 3 секунды
-    # -----------------------------------------------------
-
     splash = await message.answer(
         "✓ <b>Официальный бот Алины</b>\n\n"
         "Загрузка..."
     )
 
     await asyncio.sleep(3)
-
-    # -----------------------------------------------------
-    # Ещё 5 секунд загрузки
-    # -----------------------------------------------------
 
     loading_frames = [
         "Загрузка.\n\n▫️▫️▫️▫️▫️",
@@ -540,10 +698,6 @@ async def start_handler(message: Message, state: FSMContext):
             pass
 
         await asyncio.sleep(5 / len(loading_frames))
-
-    # -----------------------------------------------------
-    # Основной интерфейс
-    # -----------------------------------------------------
 
     text = (
         "💗 <b>Добро пожаловать!</b>\n\n"
@@ -569,7 +723,10 @@ async def start_handler(message: Message, state: FSMContext):
             )
 
     except Exception as e:
-        logger.error("Ошибка отправки главного меню: %s", e)
+        logger.error(
+            "Ошибка отправки главного меню: %s",
+            e
+        )
 
         try:
             await splash.edit_text(
@@ -578,6 +735,67 @@ async def start_handler(message: Message, state: FSMContext):
             )
         except Exception:
             pass
+
+
+# =========================================================
+# OFFICIAL BOT
+# =========================================================
+
+@dp.callback_query(F.data == "official_bot")
+async def official_bot_handler(callback: CallbackQuery):
+    text = (
+        "🔐 <b>Проверка официальности</b>\n\n"
+        "✅ Вы находитесь в официальном боте "
+        "клана <b>Крутяшки</b>.\n\n"
+        "🤖 Официальный бот:\n"
+        "<code>@krytyashki_clan_bot</code>\n\n"
+        "📢 Официальный канал:\n"
+        "<code>@alino4kaprincssss</code>\n\n"
+        "⚠️ Если другой бот использует наше название, "
+        "оформление, изображения или тексты — "
+        "проверяйте его через официальный канал."
+    )
+
+    if callback.message.photo:
+        await callback.message.edit_caption(
+            caption=text,
+            reply_markup=official_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            text,
+            reply_markup=official_keyboard()
+        )
+
+    await callback.answer()
+
+
+# =========================================================
+# BACK TO MAIN
+# =========================================================
+
+@dp.callback_query(F.data == "back_main")
+async def back_main_handler(callback: CallbackQuery):
+    text = (
+        "💗 <b>Добро пожаловать!</b>\n\n"
+        "Это официальный бот клана <b>Крутяшки</b>.\n\n"
+        "Здесь ты можешь подать заявку на вступление "
+        "и узнать информацию о клане.\n\n"
+        f"👑 Создатель: {ALINA_USERNAME}"
+    )
+
+    if callback.message.photo:
+        await callback.message.edit_caption(
+            caption=text,
+            reply_markup=main_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_keyboard()
+        )
+
+    await callback.answer()
 
 
 # =========================================================
@@ -594,18 +812,23 @@ async def about_handler(callback: CallbackQuery):
         "💗 Оригинал Алины:\n"
         f"{ALINA_USERNAME}\n\n"
         "📢 Официальный канал:\n"
-        f"{OFFICIAL_CHANNEL}\n\n"
+        "<code>@alino4kaprincssss</code>\n\n"
+        "🤖 Официальный бот:\n"
+        "<code>@krytyashki_clan_bot</code>\n\n"
         "✨ Бот создан специально для удобного "
         "приёма заявок и общения с участниками."
     )
 
-    await callback.message.edit_caption(
-        caption=text,
-        reply_markup=main_keyboard()
-    ) if callback.message.photo else await callback.message.edit_text(
-        text,
-        reply_markup=main_keyboard()
-    )
+    if callback.message.photo:
+        await callback.message.edit_caption(
+            caption=text,
+            reply_markup=main_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_keyboard()
+        )
 
     await callback.answer()
 
@@ -615,7 +838,10 @@ async def about_handler(callback: CallbackQuery):
 # =========================================================
 
 @dp.callback_query(F.data == "join")
-async def join_handler(callback: CallbackQuery, state: FSMContext):
+async def join_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
     user_id = callback.from_user.id
 
     if is_blocked(user_id):
@@ -660,7 +886,8 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
                 )
 
                 await callback.answer(
-                    f"Повторно подать заявку можно примерно через {minutes} мин.",
+                    f"Повторно подать заявку можно примерно "
+                    f"через {minutes} мин.",
                     show_alert=True
                 )
                 return
@@ -684,9 +911,14 @@ async def join_handler(callback: CallbackQuery, state: FSMContext):
 # =========================================================
 
 @dp.message(ApplicationForm.nickname)
-async def nickname_handler(message: Message, state: FSMContext):
+async def nickname_handler(
+    message: Message,
+    state: FSMContext
+):
     if is_blocked(message.from_user.id):
-        await message.answer("🚫 Доступ ограничен.")
+        await message.answer(
+            "🚫 Доступ ограничен."
+        )
         await state.clear()
         return
 
@@ -713,7 +945,10 @@ async def nickname_handler(message: Message, state: FSMContext):
 # =========================================================
 
 @dp.message(ApplicationForm.reason)
-async def reason_handler(message: Message, state: FSMContext):
+async def reason_handler(
+    message: Message,
+    state: FSMContext
+):
     reason = message.text.strip()
 
     if len(reason) < 3:
@@ -821,7 +1056,10 @@ async def pve_handler(
 # =========================================================
 
 @dp.message(ApplicationForm.age)
-async def age_handler(message: Message, state: FSMContext):
+async def age_handler(
+    message: Message,
+    state: FSMContext
+):
     text = message.text.strip()
 
     if not text.isdigit():
@@ -854,7 +1092,10 @@ async def age_handler(message: Message, state: FSMContext):
 # =========================================================
 
 @dp.message(ApplicationForm.email)
-async def email_handler(message: Message, state: FSMContext):
+async def email_handler(
+    message: Message,
+    state: FSMContext
+):
     email = message.text.strip().lower()
 
     if not re.fullmatch(
@@ -922,7 +1163,7 @@ async def email_handler(message: Message, state: FSMContext):
     admin_text = (
         "📥 <b>Новая заявка!</b>\n\n"
         f"🆔 Заявка: <code>#{application_id}</code>\n"
-        f"👤 Telegram: {username}\n"
+        f"👤 Telegram: {escape(username)}\n"
         f"🆔 User ID: <code>{message.from_user.id}</code>\n\n"
         f"🎮 Minecraft: <b>{escape(data['nickname'])}</b>\n"
         f"📝 Причина: {escape(data['reason'])}\n"
@@ -969,6 +1210,90 @@ async def admin_handler(message: Message):
         "Выберите действие:",
         reply_markup=admin_keyboard()
     )
+
+
+# =========================================================
+# ADMIN DB INFO
+# =========================================================
+
+@dp.message(Command("dbinfo"))
+async def dbinfo_handler(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    info = get_database_info()
+
+    if not info["exists"]:
+        await message.answer(
+            "❌ Файл базы данных не найден.\n\n"
+            f"Путь: <code>{escape(os.path.abspath(DB_FILE))}</code>"
+        )
+        return
+
+    size_kb = info["size"] / 1024
+
+    await message.answer(
+        "📊 <b>Информация о базе</b>\n\n"
+        f"👥 Пользователей: <b>{info['users']}</b>\n"
+        f"🚫 Заблокировано: <b>{info['blocked']}</b>\n\n"
+        f"📨 Всего заявок: <b>{info['applications']}</b>\n"
+        f"📥 На рассмотрении: <b>{info['pending']}</b>\n"
+        f"✅ Принято: <b>{info['accepted']}</b>\n"
+        f"❌ Отклонено: <b>{info['rejected']}</b>\n\n"
+        f"💾 Размер: <b>{size_kb:.2f} KB</b>\n"
+        f"📁 Файл: <code>{escape(os.path.abspath(DB_FILE))}</code>"
+    )
+
+
+# =========================================================
+# ADMIN BACKUP
+# =========================================================
+
+@dp.message(Command("backupdb"))
+async def backupdb_handler(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    await message.answer(
+        "💾 Создаю резервную копию базы..."
+    )
+
+    try:
+        backup_file = create_database_backup()
+
+        if not backup_file or not os.path.exists(backup_file):
+            await message.answer(
+                "❌ Не удалось создать резервную копию."
+            )
+            return
+
+        info = get_database_info()
+
+        await message.answer_document(
+            FSInputFile(backup_file),
+            caption=(
+                "💾 <b>Резервная копия базы «Крутяшки»</b>\n\n"
+                f"👥 Пользователей: {info['users']}\n"
+                f"📨 Заявок: {info['applications']}\n\n"
+                "Сохрани этот файл в безопасном месте."
+            )
+        )
+
+        try:
+            os.remove(backup_file)
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.exception(
+            "Ошибка создания backup: %s",
+            e
+        )
+
+        await message.answer(
+            "❌ Ошибка создания резервной копии:\n"
+            f"<code>{escape(str(e))}</code>"
+        )
 
 
 # =========================================================
@@ -1435,17 +1760,25 @@ async def admin_broadcast_process(
                 user_id,
                 text
             )
+
             sent += 1
 
             await asyncio.sleep(0.05)
 
-        except Exception:
+        except Exception as e:
             failed += 1
+
+            logger.warning(
+                "Рассылка не отправлена пользователю %s: %s",
+                user_id,
+                e
+            )
 
     await state.clear()
 
     await message.answer(
         "📢 <b>Рассылка завершена</b>\n\n"
+        f"👥 Пользователей в базе: <b>{len(users)}</b>\n"
         f"✅ Отправлено: <b>{sent}</b>\n"
         f"❌ Ошибок: <b>{failed}</b>"
     )
@@ -1493,7 +1826,11 @@ async def admin_decision_start(
 
     await state.update_data(
         application_id=app_id,
-        decision="accepted" if action == "accept" else "rejected",
+        decision=(
+            "accepted"
+            if action == "accept"
+            else "rejected"
+        ),
         target_user_id=user_id,
         nickname=nickname
     )
@@ -1601,7 +1938,7 @@ async def admin_decision_process(
             "🎉 <b>Твоя заявка принята!</b>\n\n"
             f"{escape(decision_message)}\n\n"
             "💗 Добро пожаловать в клан <b>Крутяшки</b>!\n\n"
-            f"🔑 Твой код вступления:\n"
+            "🔑 Твой код вступления:\n"
             f"<code>{join_code}</code>\n\n"
             "Сохрани этот код."
         )
@@ -1617,7 +1954,16 @@ async def admin_decision_process(
                 e
             )
 
-        nickname, email, reason, loyal, pvp, pve, age, username = application
+        (
+            nickname,
+            email,
+            reason,
+            loyal,
+            pvp,
+            pve,
+            age,
+            username
+        ) = application
 
         email_text = (
             "📧 <b>Готовый текст для отправки на Gmail</b>\n\n"
@@ -1675,7 +2021,7 @@ async def cancel_handler(
 
 
 # =========================================================
-# BLOCKED USERS
+# BLOCKED USERS / OTHER MESSAGES
 # =========================================================
 
 @dp.message()
@@ -1705,6 +2051,19 @@ async def main():
         "Бот запущен: @%s | ID: %s",
         me.username,
         me.id
+    )
+
+    logger.info(
+        "SQLite database: %s",
+        os.path.abspath(DB_FILE)
+    )
+
+    info = get_database_info()
+
+    logger.info(
+        "DB INFO | users=%s | applications=%s",
+        info["users"],
+        info["applications"]
     )
 
     await dp.start_polling(bot)
