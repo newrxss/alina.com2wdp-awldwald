@@ -3,7 +3,6 @@ import logging
 import os
 import re
 import secrets
-import random
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape
@@ -34,6 +33,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 ADMIN_ID = 1541550837
 
+# Railway Variable:
+# DB_FILE=/data/krutyashki.sqlite3
+#
+# ВАЖНО:
+# Эта программа НЕ удаляет и НЕ пересоздаёт существующую базу.
 DB_FILE = os.getenv("DB_FILE", "krutyashki.sqlite3")
 
 IMAGE_FILE = "alina.jpg"
@@ -46,10 +50,13 @@ REAPPLY_COOLDOWN_HOURS = 2
 
 
 # =========================================================
-# BREVO API / GMAIL
+# BREVO API
 # =========================================================
 
-BREVO_API_KEY = os.getenv("BREVO_API_KEY", "").strip()
+BREVO_API_KEY = os.getenv(
+    "BREVO_API_KEY",
+    ""
+).strip()
 
 BREVO_FROM_EMAIL = os.getenv(
     "BREVO_FROM_EMAIL",
@@ -64,7 +71,6 @@ BREVO_FROM_NAME = os.getenv(
 BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 EMAIL_CODE_EXPIRE_MINUTES = 10
-
 EMAIL_REQUEST_TIMEOUT = 15
 
 
@@ -143,6 +149,11 @@ def get_db():
 
 
 def init_db():
+    """
+    Создаёт таблицы только если их нет.
+    Существующие данные НЕ удаляются.
+    """
+
     conn = get_db()
     cur = conn.cursor()
 
@@ -437,6 +448,10 @@ def has_accepted_application(user_id: int) -> bool:
     return row is not None
 
 
+# =========================================================
+# UNIQUE JOIN CODE
+# =========================================================
+
 def generate_join_code():
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -453,21 +468,37 @@ def generate_join_code():
     return f"KRUT-{part1}-{part2}"
 
 
+def generate_unique_join_code(conn):
+    cur = conn.cursor()
+
+    for _ in range(100):
+
+        code = generate_join_code()
+
+        cur.execute("""
+            SELECT id
+            FROM applications
+            WHERE join_code = ?
+            LIMIT 1
+        """, (code,))
+
+        if cur.fetchone() is None:
+            return code
+
+    raise RuntimeError(
+        "Не удалось создать уникальный код вступления."
+    )
+
+
 # =========================================================
-# EMAIL VERIFICATION — BREVO HTTPS API
+# EMAIL — BREVO
 # =========================================================
 
-async def send_email_verification_code(
-    email: str,
-    code: str
+async def send_brevo_email(
+    to_email: str,
+    subject: str,
+    text_content: str
 ):
-    """
-    Отправляет код подтверждения через Brevo HTTPS API.
-
-    Railway -> HTTPS -> Brevo -> Gmail
-
-    SMTP больше не используется.
-    """
 
     if not BREVO_API_KEY:
         raise RuntimeError(
@@ -484,57 +515,6 @@ async def send_email_verification_code(
             "BREVO_FROM_NAME не указан в Railway Variables."
         )
 
-    text_content = f"""Здравствуйте!
-
-Вы указали этот Gmail при подаче заявки в клан «Крутяшки».
-
-Ваш код подтверждения:
-
-{code}
-
-Код действует {EMAIL_CODE_EXPIRE_MINUTES} минут.
-
-Если вы не подавали заявку, просто проигнорируйте это письмо.
-
-Клан «Крутяшки»
-"""
-
-    html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Подтверждение Gmail — Крутяшки</title>
-</head>
-<body>
-    <h2>Здравствуйте!</h2>
-
-    <p>
-        Вы указали этот Gmail при подаче заявки
-        в клан «Крутяшки».
-    </p>
-
-    <p>Ваш код подтверждения:</p>
-
-    <h1>{escape(code)}</h1>
-
-    <p>
-        Код действует
-        <b>{EMAIL_CODE_EXPIRE_MINUTES} минут</b>.
-    </p>
-
-    <p>
-        Если вы не подавали заявку,
-        просто проигнорируйте это письмо.
-    </p>
-
-    <p>
-        Клан «Крутяшки»
-    </p>
-</body>
-</html>
-"""
-
     payload = {
         "sender": {
             "name": BREVO_FROM_NAME,
@@ -542,12 +522,11 @@ async def send_email_verification_code(
         },
         "to": [
             {
-                "email": email
+                "email": to_email
             }
         ],
-        "subject": "Подтверждение Gmail — Крутяшки",
-        "textContent": text_content,
-        "htmlContent": html_content
+        "subject": subject,
+        "textContent": text_content
     }
 
     headers = {
@@ -561,11 +540,13 @@ async def send_email_verification_code(
     )
 
     logger.info(
-        "Brevo API: отправка кода на %s",
-        email
+        "Brevo: отправка письма на %s | subject=%s",
+        to_email,
+        subject
     )
 
     try:
+
         async with aiohttp.ClientSession(
             timeout=timeout
         ) as session:
@@ -579,8 +560,9 @@ async def send_email_verification_code(
                 response_text = await response.text()
 
                 if response.status not in (200, 201, 202):
+
                     logger.error(
-                        "Brevo API ошибка | HTTP %s | %s",
+                        "Brevo ошибка | HTTP %s | %s",
                         response.status,
                         response_text[:1000]
                     )
@@ -600,13 +582,16 @@ async def send_email_verification_code(
                 )
 
                 logger.info(
-                    "Brevo API: письмо отправлено | messageId=%s",
+                    "Brevo: письмо отправлено | messageId=%s",
                     message_id
                 )
 
+                return message_id
+
     except asyncio.TimeoutError as error:
+
         logger.exception(
-            "Brevo API: таймаут при отправке Gmail-кода"
+            "Brevo: таймаут"
         )
 
         raise RuntimeError(
@@ -614,13 +599,115 @@ async def send_email_verification_code(
         ) from error
 
     except aiohttp.ClientError as error:
+
         logger.exception(
-            "Brevo API: ошибка HTTPS-соединения"
+            "Brevo: ошибка HTTPS-соединения"
         )
 
         raise RuntimeError(
             "Не удалось подключиться к Brevo API."
         ) from error
+
+
+# =========================================================
+# EMAIL VERIFICATION
+# =========================================================
+
+async def send_email_verification_code(
+    email: str,
+    code: str
+):
+
+    text_content = f"""💗 КРУТЯШКИ
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+📧 ПОДТВЕРЖДЕНИЕ GMAIL
+
+Вы указали этот Gmail при подаче
+заявки в клан «Крутяшки».
+
+Ваш код подтверждения:
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+        {code}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⏱ Код действует {EMAIL_CODE_EXPIRE_MINUTES} минут.
+
+Если вы не подавали заявку,
+просто проигнорируйте это письмо.
+
+💗 Клан «Крутяшки»
+"""
+
+    return await send_brevo_email(
+        email,
+        "📧 Подтверждение Gmail — Крутяшки",
+        text_content
+    )
+
+
+# =========================================================
+# EMAIL ACCEPTANCE
+# =========================================================
+
+async def send_acceptance_email(
+    email: str,
+    nickname: str,
+    join_code: str,
+    decision_message: str
+):
+
+    text_content = f"""💗 КРУТЯШКИ
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎉 ВАША ЗАЯВКА ОДОБРЕНА!
+
+Здравствуйте, {nickname}!
+
+Поздравляем! Ваша заявка на вступление
+в клан «Крутяшки» была успешно одобрена.
+
+👤 ВАШ MINECRAFT НИК
+{nickname}
+
+
+🔐 ВАШ УНИКАЛЬНЫЙ КОД
+━━━━━━━━━━━━━━━━━━━━━━━━
+        {join_code}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ Обязательно сохраните этот код.
+Он понадобится для вступления в клан.
+
+
+💬 СООБЩЕНИЕ АДМИНИСТРАЦИИ
+
+{decision_message}
+
+
+📢 ОФИЦИАЛЬНЫЙ КАНАЛ
+{OFFICIAL_CHANNEL}
+
+🤖 ОФИЦИАЛЬНЫЙ БОТ
+{OFFICIAL_BOT}
+
+
+💗 Добро пожаловать в «Крутяшки»!
+
+Желаем приятной игры и хорошего общения
+с участниками клана.
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+Это автоматическое сообщение
+официального бота «Крутяшки».
+"""
+
+    return await send_brevo_email(
+        email,
+        "💗 Крутяшки — ваша заявка одобрена!",
+        text_content
+    )
 
 
 # =========================================================
@@ -632,25 +719,25 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💗 Вступить в клан",
+                    text="💗  Вступить в клан",
                     callback_data="join"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="👑 Обо мне",
+                    text="👑  Обо мне",
                     callback_data="about"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🔐 Проверить официальный бот",
+                    text="🔐  Проверить официальный бот",
                     callback_data="official_bot"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📢 Официальный канал",
+                    text="📢  Официальный канал",
                     url=OFFICIAL_CHANNEL
                 )
             ]
@@ -704,9 +791,11 @@ def rating_keyboard(prefix: str):
     buttons = []
 
     for start in (1, 6):
+
         row = []
 
         for number in range(start, start + 5):
+
             row.append(
                 InlineKeyboardButton(
                     text=str(number),
@@ -790,6 +879,26 @@ def admin_keyboard():
 
 
 # =========================================================
+# MAIN TEXT
+# =========================================================
+
+def main_menu_text():
+    return (
+        "💗 <b>КРУТЯШКИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✨ Добро пожаловать в официальный бот клана!\n\n"
+        "Здесь ты можешь:\n"
+        "💗 подать заявку на вступление\n"
+        "👑 узнать информацию о клане\n"
+        "🔐 проверить официальность бота\n"
+        "📢 перейти в официальный канал\n\n"
+        f"👑 <b>Создатель:</b> {ALINA_USERNAME}\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💗 <i>Рады видеть тебя здесь!</i>"
+    )
+
+
+# =========================================================
 # START
 # =========================================================
 
@@ -798,56 +907,58 @@ async def start_handler(
     message: Message,
     state: FSMContext
 ):
+
     await state.clear()
 
     save_user(message)
 
     if is_blocked(message.from_user.id):
+
         await message.answer(
-            "🚫 <b>Доступ ограничен.</b>\n\n"
+            "🚫 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
             "Вы не можете использовать этого бота."
         )
+
         return
 
     splash = await message.answer(
         "✓ <b>Официальный бот Алины</b>\n\n"
-        "Загрузка..."
+        "Подключение..."
     )
 
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
 
     loading_frames = [
-        "Загрузка.\n\n▫️▫️▫️▫️▫️",
-        "Загрузка..\n\n🟩▫️▫️▫️▫️",
-        "Загрузка...\n\n🟩🟩▫️▫️▫️",
-        "Загрузка...\n\n🟩🟩🟩▫️▫️",
-        "Загрузка...\n\n🟩🟩🟩🟩▫️",
-        "Загрузка...\n\n🟩🟩🟩🟩🟩",
+        "Подключение.\n\n▫️▫️▫️▫️▫️",
+        "Проверка.\n\n🟩▫️▫️▫️▫️",
+        "Загрузка.\n\n🟩🟩▫️▫️▫️",
+        "Подготовка.\n\n🟩🟩🟩▫️▫️",
+        "Почти готово.\n\n🟩🟩🟩🟩▫️",
+        "Готово!\n\n🟩🟩🟩🟩🟩",
     ]
 
     for frame in loading_frames:
+
         try:
+
             await splash.edit_text(
                 "✓ <b>Официальный бот Алины</b>\n\n"
                 f"{frame}"
             )
+
         except Exception:
             pass
 
         await asyncio.sleep(
-            5 / len(loading_frames)
+            3 / len(loading_frames)
         )
 
-    text = (
-        "💗 <b>Добро пожаловать!</b>\n\n"
-        "Это официальный бот клана <b>Крутяшки</b>.\n\n"
-        "Здесь ты можешь подать заявку на вступление "
-        "и узнать информацию о клане.\n\n"
-        f"👑 Создатель: {ALINA_USERNAME}"
-    )
+    text = main_menu_text()
 
     try:
+
         if os.path.exists(IMAGE_FILE):
+
             await splash.delete()
 
             await message.answer_photo(
@@ -855,23 +966,28 @@ async def start_handler(
                 caption=text,
                 reply_markup=main_keyboard()
             )
+
         else:
+
             await splash.edit_text(
                 text,
                 reply_markup=main_keyboard()
             )
 
     except Exception as e:
+
         logger.error(
             "Ошибка отправки главного меню: %s",
             e
         )
 
         try:
+
             await splash.edit_text(
                 text,
                 reply_markup=main_keyboard()
             )
+
         except Exception:
             pass
 
@@ -884,25 +1000,29 @@ async def start_handler(
 async def official_bot_handler(
     callback: CallbackQuery
 ):
+
     text = (
-        "🔐 <b>Проверка официальности</b>\n\n"
-        "✅ Вы находитесь в официальном боте "
-        "клана <b>Крутяшки</b>.\n\n"
-        "🤖 Официальный бот:\n"
+        "🔐 <b>ПРОВЕРКА ОФИЦИАЛЬНОСТИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ Ты находишься в официальном боте "
+        "клана <b>«Крутяшки»</b>.\n\n"
+        "🤖 <b>Официальный бот:</b>\n"
         "<code>@krytyashki_clan_bot</code>\n\n"
-        "📢 Официальный канал:\n"
+        "📢 <b>Официальный канал:</b>\n"
         "<code>@alino4kaprincssss</code>\n\n"
-        "⚠️ Если другой бот использует наше название, "
-        "оформление, изображения или тексты — "
-        "проверяйте его через официальный канал."
+        "🛡️ Используй только официальные ссылки "
+        "клана, чтобы не попасть к мошенникам."
     )
 
     if callback.message.photo:
+
         await callback.message.edit_caption(
             caption=text,
             reply_markup=official_keyboard()
         )
+
     else:
+
         await callback.message.edit_text(
             text,
             reply_markup=official_keyboard()
@@ -919,20 +1039,18 @@ async def official_bot_handler(
 async def back_main_handler(
     callback: CallbackQuery
 ):
-    text = (
-        "💗 <b>Добро пожаловать!</b>\n\n"
-        "Это официальный бот клана <b>Крутяшки</b>.\n\n"
-        "Здесь ты можешь подать заявку на вступление "
-        "и узнать информацию о клане.\n\n"
-        f"👑 Создатель: {ALINA_USERNAME}"
-    )
+
+    text = main_menu_text()
 
     if callback.message.photo:
+
         await callback.message.edit_caption(
             caption=text,
             reply_markup=main_keyboard()
         )
+
     else:
+
         await callback.message.edit_text(
             text,
             reply_markup=main_keyboard()
@@ -949,27 +1067,30 @@ async def back_main_handler(
 async def about_handler(
     callback: CallbackQuery
 ):
+
     text = (
-        "👑 <b>Обо мне</b>\n\n"
-        "Я — бот-помощник клана <b>Крутяшки</b>.\n\n"
-        "Здесь можно подать заявку на вступление "
-        "в клан Алины.\n\n"
-        "💗 Оригинал Алины:\n"
-        f"{ALINA_USERNAME}\n\n"
-        "📢 Официальный канал:\n"
-        "<code>@alino4kaprincssss</code>\n\n"
-        "🤖 Официальный бот:\n"
-        "<code>@krytyashki_clan_bot</code>\n\n"
-        "✨ Бот создан специально для удобного "
-        "приёма заявок и общения с участниками."
+        "👑 <b>О КЛАНЕ «КРУТЯШКИ»</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "💗 Это официальный бот клана <b>Крутяшки</b>.\n\n"
+        "Здесь принимаются заявки новых участников "
+        "и предоставляется официальная информация.\n\n"
+        "✨ <b>НАШИ РЕСУРСЫ</b>\n\n"
+        f"👑 Создатель: {ALINA_USERNAME}\n"
+        "🤖 Бот: <code>@krytyashki_clan_bot</code>\n"
+        "📢 Канал: <code>@alino4kaprincssss</code>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💗 <i>Добро пожаловать в нашу команду!</i>"
     )
 
     if callback.message.photo:
+
         await callback.message.edit_caption(
             caption=text,
             reply_markup=main_keyboard()
         )
+
     else:
+
         await callback.message.edit_text(
             text,
             reply_markup=main_keyboard()
@@ -987,56 +1108,76 @@ async def join_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     user_id = callback.from_user.id
 
     if is_blocked(user_id):
+
         await callback.answer(
             "Доступ ограничен.",
             show_alert=True
         )
+
         return
 
     if has_accepted_application(user_id):
+
         await callback.answer(
             "Вы уже приняты в клан!",
             show_alert=True
         )
+
         return
 
     if application_exists_pending(user_id):
+
         await callback.answer(
             "Ваша заявка уже находится на рассмотрении.",
             show_alert=True
         )
+
         return
 
-    last_rejected = get_last_rejected_application(user_id)
+    last_rejected = get_last_rejected_application(
+        user_id
+    )
 
     if last_rejected:
+
         try:
+
             rejected_time = datetime.fromisoformat(
                 last_rejected
             )
 
-            if datetime.now() < rejected_time + timedelta(
-                hours=REAPPLY_COOLDOWN_HOURS
-            ):
+            cooldown_end = (
+                rejected_time
+                + timedelta(
+                    hours=REAPPLY_COOLDOWN_HOURS
+                )
+            )
+
+            if datetime.now() < cooldown_end:
+
                 remaining = (
-                    rejected_time
-                    + timedelta(hours=REAPPLY_COOLDOWN_HOURS)
+                    cooldown_end
                     - datetime.now()
                 )
 
                 minutes = max(
                     1,
-                    int(remaining.total_seconds() // 60)
+                    int(
+                        remaining.total_seconds()
+                        // 60
+                    )
                 )
 
                 await callback.answer(
-                    f"Повторно подать заявку можно примерно "
-                    f"через {minutes} мин.",
+                    f"Повторная заявка будет доступна "
+                    f"примерно через {minutes} мин.",
                     show_alert=True
                 )
+
                 return
 
         except Exception:
@@ -1047,9 +1188,14 @@ async def join_handler(
     )
 
     await callback.message.answer(
-        "💗 <b>Заявка на вступление</b>\n\n"
-        "Шаг 1 из 7\n\n"
-        "🎮 Напиши свой <b>Minecraft ник</b>:"
+        "💗 <b>ВСТУПЛЕНИЕ В КЛАН</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✨ Отлично! Давай познакомимся.\n\n"
+        "Тебе нужно пройти небольшую анкету "
+        "из <b>7 шагов</b>.\n\n"
+        "🎮 <b>ШАГ 1 ИЗ 7</b>\n\n"
+        "Напиши свой <b>Minecraft ник</b>:\n\n"
+        "💡 <i>Например: Steve123</i>"
     )
 
     await callback.answer()
@@ -1064,20 +1210,29 @@ async def nickname_handler(
     message: Message,
     state: FSMContext
 ):
+
     if is_blocked(message.from_user.id):
+
         await message.answer(
-            "🚫 Доступ ограничен."
+            "🚫 <b>Доступ ограничен.</b>"
         )
+
         await state.clear()
+
         return
 
-    nickname = (message.text or "").strip()
+    nickname = (
+        message.text or ""
+    ).strip()
 
     if len(nickname) < 2 or len(nickname) > 32:
+
         await message.answer(
-            "❌ Ник должен содержать от 2 до 32 символов.\n"
+            "❌ <b>Некорректный ник.</b>\n\n"
+            "Ник должен содержать от 2 до 32 символов.\n\n"
             "Попробуй ещё раз:"
         )
+
         return
 
     await state.update_data(
@@ -1089,8 +1244,12 @@ async def nickname_handler(
     )
 
     await message.answer(
-        "📝 <b>Шаг 2 из 7</b>\n\n"
-        "Почему ты хочешь вступить в клан?"
+        "📝 <b>ШАГ 2 ИЗ 7</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Почему ты хочешь вступить в "
+        "<b>«Крутяшки»</b>?\n\n"
+        "💡 Расскажи немного о себе и почему "
+        "тебе интересен наш клан."
     )
 
 
@@ -1103,12 +1262,18 @@ async def reason_handler(
     message: Message,
     state: FSMContext
 ):
-    reason = (message.text or "").strip()
+
+    reason = (
+        message.text or ""
+    ).strip()
 
     if len(reason) < 3:
+
         await message.answer(
-            "Напиши немного подробнее, почему хочешь вступить:"
+            "📝 Напиши немного подробнее, "
+            "почему хочешь вступить:"
         )
+
         return
 
     await state.update_data(
@@ -1120,8 +1285,11 @@ async def reason_handler(
     )
 
     await message.answer(
-        "💗 <b>Шаг 3 из 7</b>\n\n"
-        "Готов ли ты быть верным клану и уважать Алину?",
+        "💗 <b>ШАГ 3 ИЗ 7</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Готов ли ты быть верным клану "
+        "и уважать его участников и Алину?\n\n"
+        "Выбери подходящий вариант:",
         reply_markup=loyal_keyboard()
     )
 
@@ -1132,12 +1300,16 @@ async def reason_handler(
 
 @dp.callback_query(
     ApplicationForm.loyal,
-    F.data.in_({"loyal_yes", "loyal_no"})
+    F.data.in_({
+        "loyal_yes",
+        "loyal_no"
+    })
 )
 async def loyal_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     loyal = (
         "Да"
         if callback.data == "loyal_yes"
@@ -1153,10 +1325,12 @@ async def loyal_handler(
     )
 
     await callback.message.answer(
-        "⚔️ <b>Шаг 4 из 7</b>\n\n"
-        "Оцени свой <b>PvP</b> от 1 до 10:\n\n"
-        "1 — начинающий\n"
-        "10 — очень сильный игрок",
+        "⚔️ <b>ШАГ 4 ИЗ 7 — PvP</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Как бы ты оценил свои навыки в PvP?\n\n"
+        "🟢 1 — только начинаю\n"
+        "🔥 10 — очень сильный игрок\n\n"
+        "Выбери число:",
         reply_markup=rating_keyboard("pvp")
     )
 
@@ -1175,6 +1349,7 @@ async def pvp_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     pvp = int(
         callback.data.split("_")[1]
     )
@@ -1188,10 +1363,12 @@ async def pvp_handler(
     )
 
     await callback.message.answer(
-        "⛏️ <b>Шаг 5 из 7</b>\n\n"
-        "Оцени свои навыки <b>PvE</b> от 1 до 10:\n\n"
-        "1 — начинающий\n"
-        "10 — очень сильный игрок",
+        "⛏️ <b>ШАГ 5 ИЗ 7 — PvE</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Как бы ты оценил свои навыки в PvE?\n\n"
+        "🟢 1 — только начинаю\n"
+        "🔥 10 — очень сильный игрок\n\n"
+        "Выбери число:",
         reply_markup=rating_keyboard("pve")
     )
 
@@ -1210,6 +1387,7 @@ async def pve_handler(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     pve = int(
         callback.data.split("_")[1]
     )
@@ -1223,8 +1401,10 @@ async def pve_handler(
     )
 
     await callback.message.answer(
-        "🎂 <b>Шаг 6 из 7</b>\n\n"
-        "Сколько тебе лет?"
+        "🎂 <b>ШАГ 6 ИЗ 7</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Сколько тебе лет?\n\n"
+        "🔢 Напиши только число."
     )
 
     await callback.answer()
@@ -1239,20 +1419,27 @@ async def age_handler(
     message: Message,
     state: FSMContext
 ):
-    text = (message.text or "").strip()
+
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text.isdigit():
+
         await message.answer(
             "❌ Напиши возраст числом."
         )
+
         return
 
     age = int(text)
 
     if age < 1 or age > 100:
+
         await message.answer(
             "❌ Укажи корректный возраст."
         )
+
         return
 
     await state.update_data(
@@ -1264,10 +1451,15 @@ async def age_handler(
     )
 
     await message.answer(
-        "📧 <b>Шаг 7 из 7</b>\n\n"
-        "Укажи свой Gmail для связи:\n\n"
-        "Например:\n"
-        "<code>example@gmail.com</code>"
+        "📧 <b>ШАГ 7 ИЗ 7</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Остался последний шаг!\n\n"
+        "Укажи свой <b>Gmail</b> — на него мы "
+        "отправим код подтверждения.\n\n"
+        "📩 Например:\n"
+        "<code>example@gmail.com</code>\n\n"
+        "🔒 Твой адрес используется только для "
+        "связи по заявке."
     )
 
 
@@ -1280,6 +1472,7 @@ async def email_handler(
     message: Message,
     state: FSMContext
 ):
+
     email = (
         message.text or ""
     ).strip().lower()
@@ -1288,14 +1481,17 @@ async def email_handler(
         r"[a-zA-Z0-9._%+-]+@gmail\.com",
         email
     ):
+
         await message.answer(
-            "❌ Нужен именно адрес Gmail.\n\n"
-            "Пример:\n"
+            "❌ <b>Нужен именно адрес Gmail.</b>\n\n"
+            "Например:\n"
             "<code>example@gmail.com</code>"
         )
+
         return
 
     if not BREVO_API_KEY:
+
         logger.error(
             "BREVO_API_KEY не настроен."
         )
@@ -1305,9 +1501,11 @@ async def email_handler(
             "не настроена администрацией.\n\n"
             "Попробуй позже."
         )
+
         return
 
     if not BREVO_FROM_EMAIL:
+
         logger.error(
             "BREVO_FROM_EMAIL не настроен."
         )
@@ -1317,37 +1515,47 @@ async def email_handler(
             "не настроена администрацией.\n\n"
             "Попробуй позже."
         )
+
         return
 
     code = str(
-        random.randint(100000, 999999)
+        secrets.randbelow(900000) + 100000
     )
 
     status_message = await message.answer(
-        "📨 <b>Отправляю код на Gmail...</b>\n\n"
-        "Это может занять несколько секунд."
+        "📨 <b>ОТПРАВЛЯЮ КОД</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Отправляем код подтверждения "
+        "на твой Gmail.\n\n"
+        "⏳ Это может занять несколько секунд..."
     )
 
     try:
+
         await send_email_verification_code(
             email,
             code
         )
 
     except Exception as e:
+
         logger.exception(
             "Ошибка отправки Gmail-кода: %s",
             e
         )
 
         try:
+
             await status_message.edit_text(
                 "❌ <b>Не удалось отправить код.</b>\n\n"
-                "Проверь Gmail и попробуй ещё раз.\n\n"
+                "Проверь правильность Gmail и попробуй "
+                "ещё раз.\n\n"
                 "Если проблема повторяется — "
                 "сообщи администрации."
             )
+
         except Exception:
+
             await message.answer(
                 "❌ Не удалось отправить код.\n\n"
                 "Попробуй ещё раз."
@@ -1366,15 +1574,19 @@ async def email_handler(
     )
 
     try:
+
         await status_message.edit_text(
-            "📨 <b>Код отправлен!</b>\n\n"
-            "Мы отправили 6-значный код на:\n"
+            "📨 <b>КОД ОТПРАВЛЕН!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "Мы отправили код на:\n"
             f"<code>{escape(email)}</code>\n\n"
-            "Введи код из письма сюда.\n\n"
+            "🔢 Введи 6-значный код из письма сюда.\n\n"
             f"⏱ Код действует "
             f"{EMAIL_CODE_EXPIRE_MINUTES} минут."
         )
+
     except Exception:
+
         await message.answer(
             "📨 <b>Код отправлен!</b>\n\n"
             "Введи код из письма.\n\n"
@@ -1392,13 +1604,21 @@ async def email_code_handler(
     message: Message,
     state: FSMContext
 ):
-    code = (message.text or "").strip()
 
-    if not re.fullmatch(r"\d{6}", code):
+    code = (
+        message.text or ""
+    ).strip()
+
+    if not re.fullmatch(
+        r"\d{6}",
+        code
+    ):
+
         await message.answer(
             "❌ Код должен состоять из 6 цифр.\n\n"
             "Попробуй ещё раз:"
         )
+
         return
 
     data = await state.get_data()
@@ -1420,44 +1640,54 @@ async def email_code_handler(
         or not created_at_text
         or not email
     ):
+
         await state.clear()
 
         await message.answer(
             "❌ Сессия подтверждения истекла.\n\n"
             "Начни подачу заявки заново."
         )
+
         return
 
     try:
+
         created_at = datetime.fromisoformat(
             created_at_text
         )
 
     except Exception:
+
         await state.clear()
 
         await message.answer(
             "❌ Ошибка проверки кода.\n\n"
             "Начни заявку заново."
         )
+
         return
 
     if datetime.now() > created_at + timedelta(
         minutes=EMAIL_CODE_EXPIRE_MINUTES
     ):
+
         await state.clear()
 
         await message.answer(
-            "⌛ <b>Код истёк.</b>\n\n"
-            "Начни заявку заново, чтобы получить новый код."
+            "⌛ <b>КОД ИСТЁК</b>\n\n"
+            "Начни заявку заново, чтобы получить "
+            "новый код."
         )
+
         return
 
     if code != saved_code:
+
         await message.answer(
-            "❌ Неверный код.\n\n"
+            "❌ <b>Неверный код.</b>\n\n"
             "Проверь письмо и введи код ещё раз."
         )
+
         return
 
     now = datetime.now().isoformat()
@@ -1510,7 +1740,8 @@ async def email_code_handler(
     )
 
     admin_text = (
-        "📥 <b>Новая заявка!</b>\n\n"
+        "📥 <b>НОВАЯ ЗАЯВКА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"🆔 Заявка: <code>#{application_id}</code>\n"
         f"👤 Telegram: {escape(username)}\n"
         f"🆔 User ID: <code>{message.from_user.id}</code>\n\n"
@@ -1522,10 +1753,12 @@ async def email_code_handler(
         f"🎂 Возраст: <b>{data['age']}</b>\n"
         f"📧 Gmail: <code>{escape(email)}</code>\n"
         "✅ Gmail подтверждён\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
         "Выберите решение:"
     )
 
     try:
+
         await bot.send_message(
             ADMIN_ID,
             admin_text,
@@ -1535,16 +1768,20 @@ async def email_code_handler(
         )
 
     except Exception as e:
+
         logger.error(
             "Не удалось отправить заявку админу: %s",
             e
         )
 
     await message.answer(
-        "✅ <b>Gmail подтверждён!</b>\n\n"
-        "📥 <b>Заявка отправлена администрации.</b>\n\n"
-        "Теперь её рассмотрит администрация клана.\n"
-        "Ожидай решения 💗"
+        "💗 <b>ЗАЯВКА ОТПРАВЛЕНА!</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "✅ Gmail успешно подтверждён.\n\n"
+        "📥 Заявка передана администрации "
+        "клана на рассмотрение.\n\n"
+        "⏳ Теперь остаётся дождаться решения.\n\n"
+        "💗 Спасибо за заявку!"
     )
 
 
@@ -1556,36 +1793,47 @@ async def email_code_handler(
 async def admin_handler(
     message: Message
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
     await message.answer(
-        "👑 <b>Панель администратора</b>\n\n"
-        "Выберите действие:",
+        "👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Выберите нужный раздел:",
         reply_markup=admin_keyboard()
     )
 
+
+# =========================================================
+# DB INFO
+# =========================================================
 
 @dp.message(Command("dbinfo"))
 async def dbinfo_handler(
     message: Message
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
     info = get_database_info()
 
     if not info["exists"]:
+
         await message.answer(
-            "❌ Файл базы данных не найден.\n\n"
-            f"Путь: <code>{escape(os.path.abspath(DB_FILE))}</code>"
+            "❌ <b>Файл базы данных не найден.</b>\n\n"
+            f"Путь:\n"
+            f"<code>{escape(os.path.abspath(DB_FILE))}</code>"
         )
+
         return
 
     size_kb = info["size"] / 1024
 
     await message.answer(
-        "📊 <b>Информация о базе</b>\n\n"
+        "📊 <b>БАЗА ДАННЫХ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"👥 Пользователей: <b>{info['users']}</b>\n"
         f"🚫 Заблокировано: <b>{info['blocked']}</b>\n\n"
         f"📨 Всего заявок: <b>{info['applications']}</b>\n"
@@ -1593,31 +1841,40 @@ async def dbinfo_handler(
         f"✅ Принято: <b>{info['accepted']}</b>\n"
         f"❌ Отклонено: <b>{info['rejected']}</b>\n\n"
         f"💾 Размер: <b>{size_kb:.2f} KB</b>\n"
-        f"📁 Файл: <code>{escape(os.path.abspath(DB_FILE))}</code>"
+        f"📁 Файл:\n"
+        f"<code>{escape(os.path.abspath(DB_FILE))}</code>"
     )
 
+
+# =========================================================
+# BACKUP
+# =========================================================
 
 @dp.message(Command("backupdb"))
 async def backupdb_handler(
     message: Message
 ):
+
     if message.from_user.id != ADMIN_ID:
         return
 
     await message.answer(
-        "💾 Создаю резервную копию базы..."
+        "💾 <b>Создаю резервную копию...</b>"
     )
 
     try:
+
         backup_file = create_database_backup()
 
         if (
             not backup_file
             or not os.path.exists(backup_file)
         ):
+
             await message.answer(
                 "❌ Не удалось создать резервную копию."
             )
+
             return
 
         info = get_database_info()
@@ -1625,10 +1882,11 @@ async def backupdb_handler(
         await message.answer_document(
             FSInputFile(backup_file),
             caption=(
-                "💾 <b>Резервная копия базы «Крутяшки»</b>\n\n"
+                "💾 <b>РЕЗЕРВНАЯ КОПИЯ «КРУТЯШКИ»</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
                 f"👥 Пользователей: {info['users']}\n"
                 f"📨 Заявок: {info['applications']}\n\n"
-                "Сохрани этот файл в безопасном месте."
+                "🔐 Сохрани этот файл в безопасном месте."
             )
         )
 
@@ -1638,6 +1896,7 @@ async def backupdb_handler(
             pass
 
     except Exception as e:
+
         logger.exception(
             "Ошибка создания backup: %s",
             e
@@ -1657,6 +1916,7 @@ async def backupdb_handler(
 async def admin_stats(
     callback: CallbackQuery
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1700,7 +1960,8 @@ async def admin_stats(
     conn.close()
 
     await callback.message.answer(
-        "📊 <b>Статистика</b>\n\n"
+        "📊 <b>СТАТИСТИКА КЛАНА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"👥 Пользователей: <b>{users}</b>\n"
         f"🚫 Заблокировано: <b>{blocked}</b>\n\n"
         f"📨 Всего заявок: <b>{total}</b>\n"
@@ -1720,6 +1981,7 @@ async def admin_stats(
 async def admin_pending(
     callback: CallbackQuery
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1727,7 +1989,13 @@ async def admin_pending(
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, user_id, nickname, pvp, pve, created_at
+        SELECT
+            id,
+            user_id,
+            nickname,
+            pvp,
+            pve,
+            created_at
         FROM applications
         WHERE status = 'pending'
         ORDER BY id DESC
@@ -1738,15 +2006,24 @@ async def admin_pending(
     conn.close()
 
     if not rows:
+
         await callback.message.answer(
-            "📥 Новых заявок нет."
+            "📥 <b>Новых заявок нет.</b>\n\n"
+            "Когда появится новая заявка, "
+            "она будет показана здесь."
         )
+
         await callback.answer()
+
         return
 
-    text = "📥 <b>Заявки на рассмотрении</b>\n\n"
+    text = (
+        "📥 <b>ЗАЯВКИ НА РАССМОТРЕНИИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+    )
 
     for row in rows:
+
         (
             app_id,
             user_id,
@@ -1758,13 +2035,15 @@ async def admin_pending(
 
         text += (
             f"🆔 <code>#{app_id}</code>\n"
-            f"🎮 {escape(nickname)}\n"
-            f"⚔️ PvP: {pvp}/10 | ⛏️ PvE: {pve}/10\n"
+            f"🎮 <b>{escape(nickname)}</b>\n"
+            f"⚔️ PvP: {pvp}/10\n"
+            f"⛏️ PvE: {pve}/10\n"
             f"👤 ID: <code>{user_id}</code>\n"
             f"🕐 {created_at[:16]}\n\n"
         )
 
     await callback.message.answer(text)
+
     await callback.answer()
 
 
@@ -1776,6 +2055,7 @@ async def admin_pending(
 async def admin_recent(
     callback: CallbackQuery
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1783,7 +2063,11 @@ async def admin_recent(
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, nickname, status, created_at
+        SELECT
+            id,
+            nickname,
+            status,
+            created_at
         FROM applications
         ORDER BY id DESC
         LIMIT 15
@@ -1793,13 +2077,19 @@ async def admin_recent(
     conn.close()
 
     if not rows:
+
         await callback.message.answer(
-            "🗂 Заявок пока нет."
+            "🗂 <b>Заявок пока нет.</b>"
         )
+
         await callback.answer()
+
         return
 
-    text = "🗂 <b>Последние заявки</b>\n\n"
+    text = (
+        "🗂 <b>ПОСЛЕДНИЕ ЗАЯВКИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+    )
 
     status_names = {
         "pending": "📥 На рассмотрении",
@@ -1822,6 +2112,7 @@ async def admin_recent(
         )
 
     await callback.message.answer(text)
+
     await callback.answer()
 
 
@@ -1834,6 +2125,7 @@ async def admin_search_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1842,7 +2134,8 @@ async def admin_search_start(
     )
 
     await callback.message.answer(
-        "🔎 Введи ID заявки.\n\n"
+        "🔎 <b>ПОИСК ЗАЯВКИ</b>\n\n"
+        "Введи ID заявки.\n\n"
         "Например:\n"
         "<code>15</code>"
     )
@@ -1855,16 +2148,23 @@ async def admin_search_result(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
+
         await state.clear()
+
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text.isdigit():
+
         await message.answer(
             "❌ ID должен быть числом."
         )
+
         return
 
     app_id = int(text)
@@ -1899,9 +2199,11 @@ async def admin_search_result(
     await state.clear()
 
     if not row:
+
         await message.answer(
             "❌ Заявка не найдена."
         )
+
         return
 
     (
@@ -1923,18 +2225,19 @@ async def admin_search_result(
     ) = row
 
     await message.answer(
-        "🔎 <b>Заявка найдена</b>\n\n"
-        f"🆔 #{app_id}\n"
+        "🔎 <b>ЗАЯВКА НАЙДЕНА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Заявка: <code>#{app_id}</code>\n"
         f"👤 ID: <code>{user_id}</code>\n"
-        f"👤 Username: @{escape(username or 'нет')}\n"
+        f"👤 Username: @{escape(username or 'нет')}\n\n"
         f"🎮 Minecraft: <b>{escape(nickname)}</b>\n"
         f"📝 Причина: {escape(reason)}\n"
         f"💗 Верность: {escape(loyal)}\n"
         f"⚔️ PvP: {pvp}/10\n"
         f"⛏️ PvE: {pve}/10\n"
         f"🎂 Возраст: {age}\n"
-        f"📧 Gmail: <code>{escape(email or 'нет')}</code>\n"
-        f"🔑 Код: <code>{escape(join_code or 'ещё нет')}</code>\n"
+        f"📧 Gmail: <code>{escape(email or 'нет')}</code>\n\n"
+        f"🔐 Код: <code>{escape(join_code or 'ещё нет')}</code>\n"
         f"📌 Статус: <b>{escape(status)}</b>\n"
         f"🕐 Создана: {created_at}"
     )
@@ -1948,6 +2251,7 @@ async def admin_search_result(
 async def admin_users(
     callback: CallbackQuery
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -1955,7 +2259,11 @@ async def admin_users(
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT user_id, username, first_name, blocked
+        SELECT
+            user_id,
+            username,
+            first_name,
+            blocked
         FROM users
         ORDER BY created_at DESC
         LIMIT 30
@@ -1965,13 +2273,19 @@ async def admin_users(
     conn.close()
 
     if not rows:
+
         await callback.message.answer(
             "👥 Пользователей пока нет."
         )
+
         await callback.answer()
+
         return
 
-    text = "👥 <b>Пользователи</b>\n\n"
+    text = (
+        "👥 <b>ПОЛЬЗОВАТЕЛИ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+    )
 
     for (
         user_id,
@@ -1989,6 +2303,7 @@ async def admin_users(
         )
 
     await callback.message.answer(text)
+
     await callback.answer()
 
 
@@ -2001,6 +2316,7 @@ async def admin_block_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -2009,7 +2325,8 @@ async def admin_block_start(
     )
 
     await callback.message.answer(
-        "🚫 Введи Telegram ID пользователя:"
+        "🚫 <b>БЛОКИРОВКА</b>\n\n"
+        "Введи Telegram ID пользователя:"
     )
 
     await callback.answer()
@@ -2020,25 +2337,35 @@ async def admin_block_process(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
+
         await state.clear()
+
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text.isdigit():
+
         await message.answer(
             "❌ Telegram ID должен быть числом."
         )
+
         return
 
     user_id = int(text)
 
     if user_id == ADMIN_ID:
+
         await message.answer(
             "❌ Нельзя заблокировать владельца."
         )
+
         await state.clear()
+
         return
 
     set_blocked(
@@ -2049,7 +2376,8 @@ async def admin_block_process(
     await state.clear()
 
     await message.answer(
-        f"🚫 Пользователь <code>{user_id}</code> заблокирован."
+        "🚫 <b>Пользователь заблокирован.</b>\n\n"
+        f"ID: <code>{user_id}</code>"
     )
 
 
@@ -2062,6 +2390,7 @@ async def admin_unblock_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -2070,7 +2399,8 @@ async def admin_unblock_start(
     )
 
     await callback.message.answer(
-        "🔓 Введи Telegram ID пользователя:"
+        "🔓 <b>РАЗБЛОКИРОВКА</b>\n\n"
+        "Введи Telegram ID пользователя:"
     )
 
     await callback.answer()
@@ -2081,16 +2411,23 @@ async def admin_unblock_process(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
+
         await state.clear()
+
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text.isdigit():
+
         await message.answer(
             "❌ Telegram ID должен быть числом."
         )
+
         return
 
     user_id = int(text)
@@ -2103,7 +2440,8 @@ async def admin_unblock_process(
     await state.clear()
 
     await message.answer(
-        f"🔓 Пользователь <code>{user_id}</code> разблокирован."
+        "🔓 <b>Пользователь разблокирован.</b>\n\n"
+        f"ID: <code>{user_id}</code>"
     )
 
 
@@ -2116,6 +2454,7 @@ async def admin_broadcast_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -2124,7 +2463,9 @@ async def admin_broadcast_start(
     )
 
     await callback.message.answer(
-        "📢 Напиши сообщение для рассылки:"
+        "📢 <b>РАССЫЛКА</b>\n\n"
+        "Напиши сообщение, которое нужно "
+        "отправить пользователям:"
     )
 
     await callback.answer()
@@ -2135,16 +2476,23 @@ async def admin_broadcast_process(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
+
         await state.clear()
+
         return
 
-    text = (message.text or "").strip()
+    text = (
+        message.text or ""
+    ).strip()
 
     if not text:
+
         await message.answer(
             "❌ Сообщение не может быть пустым."
         )
+
         return
 
     users = get_all_users()
@@ -2153,7 +2501,9 @@ async def admin_broadcast_process(
     failed = 0
 
     for user_id in users:
+
         try:
+
             await bot.send_message(
                 user_id,
                 text
@@ -2164,10 +2514,12 @@ async def admin_broadcast_process(
             await asyncio.sleep(0.05)
 
         except Exception as e:
+
             failed += 1
 
             logger.warning(
-                "Рассылка не отправлена пользователю %s: %s",
+                "Рассылка не отправлена пользователю "
+                "%s: %s",
                 user_id,
                 e
             )
@@ -2175,7 +2527,8 @@ async def admin_broadcast_process(
     await state.clear()
 
     await message.answer(
-        "📢 <b>Рассылка завершена</b>\n\n"
+        "📢 <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
         f"👥 Пользователей в базе: <b>{len(users)}</b>\n"
         f"✅ Отправлено: <b>{sent}</b>\n"
         f"❌ Ошибок: <b>{failed}</b>"
@@ -2193,6 +2546,7 @@ async def admin_decision_start(
     callback: CallbackQuery,
     state: FSMContext
 ):
+
     if callback.from_user.id != ADMIN_ID:
         return
 
@@ -2206,20 +2560,25 @@ async def admin_decision_start(
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT user_id, nickname
+        SELECT
+            user_id,
+            nickname
         FROM applications
         WHERE id = ?
           AND status = 'pending'
     """, (app_id,))
 
     row = cur.fetchone()
+
     conn.close()
 
     if not row:
+
         await callback.answer(
             "Заявка уже обработана или не найдена.",
             show_alert=True
         )
+
         return
 
     user_id, nickname = row
@@ -2240,16 +2599,18 @@ async def admin_decision_start(
     )
 
     title = (
-        "✅ Принятие заявки"
+        "✅ ПРИНЯТИЕ ЗАЯВКИ"
         if action == "accept"
-        else "❌ Отклонение заявки"
+        else "❌ ОТКЛОНЕНИЕ ЗАЯВКИ"
     )
 
     await callback.message.answer(
-        f"<b>{title}</b>\n\n"
-        f"Заявка: <code>#{app_id}</code>\n"
-        f"Игрок: <b>{escape(nickname)}</b>\n\n"
-        "Напиши сообщение, которое будет отправлено игроку."
+        f"<b>{title}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Заявка: <code>#{app_id}</code>\n"
+        f"🎮 Игрок: <b>{escape(nickname)}</b>\n\n"
+        "Напиши сообщение, которое будет "
+        "отправлено игроку."
     )
 
     await callback.answer()
@@ -2264,8 +2625,11 @@ async def admin_decision_process(
     message: Message,
     state: FSMContext
 ):
+
     if message.from_user.id != ADMIN_ID:
+
         await state.clear()
+
         return
 
     decision_message = (
@@ -2273,9 +2637,11 @@ async def admin_decision_process(
     ).strip()
 
     if not decision_message:
+
         await message.answer(
             "❌ Сообщение не может быть пустым."
         )
+
         return
 
     data = await state.get_data()
@@ -2284,32 +2650,280 @@ async def admin_decision_process(
     decision = data["decision"]
     user_id = data["target_user_id"]
 
-    conn = get_db()
-    cur = conn.cursor()
-
-    now = datetime.now().isoformat()
-    join_code = None
+    # =====================================================
+    # ПРИНЯТИЕ
+    # =====================================================
 
     if decision == "accepted":
 
-        join_code = generate_join_code()
+        conn = get_db()
+        cur = conn.cursor()
 
-        cur.execute("""
-            UPDATE applications
-            SET status = ?,
-                decided_at = ?,
-                decision_message = ?,
-                join_code = ?
-            WHERE id = ?
-        """, (
-            "accepted",
-            now,
-            decision_message,
-            join_code,
-            app_id
-        ))
+        try:
+
+            cur.execute("""
+                SELECT
+                    nickname,
+                    email
+                FROM applications
+                WHERE id = ?
+                  AND status = 'pending'
+            """, (app_id,))
+
+            application = cur.fetchone()
+
+            if not application:
+
+                conn.close()
+
+                await state.clear()
+
+                await message.answer(
+                    "❌ Заявка уже обработана или не найдена."
+                )
+
+                return
+
+            nickname, email = application
+
+            join_code = generate_unique_join_code(
+                conn
+            )
+
+            now = datetime.now().isoformat()
+
+            cur.execute("""
+                UPDATE applications
+                SET status = ?,
+                    decided_at = ?,
+                    decision_message = ?,
+                    join_code = ?
+                WHERE id = ?
+                  AND status = 'pending'
+            """, (
+                "accepted",
+                now,
+                decision_message,
+                join_code,
+                app_id
+            ))
+
+            if cur.rowcount != 1:
+
+                conn.rollback()
+                conn.close()
+
+                await state.clear()
+
+                await message.answer(
+                    "❌ Не удалось изменить статус заявки."
+                )
+
+                return
+
+            conn.commit()
+
+        except Exception:
+
+            conn.rollback()
+            conn.close()
+
+            raise
+
+        conn.close()
+
+        await state.clear()
+
+        # =================================================
+        # TELEGRAM
+        # =================================================
+
+        user_text = (
+            "💗 <b>КРУТЯШКИ</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🎉 <b>ТВОЯ ЗАЯВКА ОДОБРЕНА!</b>\n\n"
+            f"Здравствуйте, <b>{escape(nickname)}</b>!\n\n"
+            "Поздравляем! Теперь ты официально принят "
+            "в клан <b>«Крутяшки»</b>. 🥳\n\n"
+            "💬 <b>Сообщение администрации:</b>\n"
+            f"<i>{escape(decision_message)}</i>\n\n"
+            "🔐 <b>ТВОЙ УНИКАЛЬНЫЙ КОД:</b>\n\n"
+            f"<code>{escape(join_code)}</code>\n\n"
+            "⚠️ <b>Сохрани этот код!</b>\n"
+            "Он понадобится для вступления.\n\n"
+            "📧 Копия кода отправлена на твой Gmail.\n\n"
+            "📢 <b>Официальный канал:</b>\n"
+            f"{OFFICIAL_CHANNEL}\n\n"
+            "💗 <b>Добро пожаловать в «Крутяшки»!</b>"
+        )
+
+        telegram_sent = False
+
+        try:
+
+            await bot.send_message(
+                user_id,
+                user_text
+            )
+
+            telegram_sent = True
+
+        except Exception as e:
+
+            logger.error(
+                "Не удалось уведомить пользователя %s: %s",
+                user_id,
+                e
+            )
+
+        # =================================================
+        # EMAIL
+        # =================================================
+
+        email_sent = False
+        email_error = None
+
+        if email:
+
+            try:
+
+                await send_acceptance_email(
+                    email=email,
+                    nickname=nickname,
+                    join_code=join_code,
+                    decision_message=decision_message
+                )
+
+                email_sent = True
+
+            except Exception as e:
+
+                email_error = str(e)
+
+                logger.exception(
+                    "Не удалось отправить письмо "
+                    "о принятии заявки #%s: %s",
+                    app_id,
+                    e
+                )
+
+        else:
+
+            email_error = (
+                "У заявки отсутствует Gmail."
+            )
+
+        # =================================================
+        # ADMIN RESULT
+        # =================================================
+
+        result_lines = [
+            "💗 <b>ЗАЯВКА ПРИНЯТА</b>",
+            "━━━━━━━━━━━━━━━━━━",
+            "",
+            f"🆔 Заявка: <code>#{app_id}</code>",
+            f"👤 Пользователь: <code>{user_id}</code>",
+            f"🎮 Minecraft: <b>{escape(nickname)}</b>",
+            "",
+            f"🔐 Код: <code>{escape(join_code)}</code>",
+            ""
+        ]
+
+        if telegram_sent:
+
+            result_lines.append(
+                "📱 Telegram: ✅ отправлено"
+            )
+
+        else:
+
+            result_lines.append(
+                "📱 Telegram: ❌ не удалось отправить"
+            )
+
+        if email_sent:
+
+            result_lines.append(
+                "📧 Gmail: "
+                f"✅ отправлено на "
+                f"<code>{escape(email)}</code>"
+            )
+
+        else:
+
+            result_lines.append(
+                "📧 Gmail: ❌ письмо не отправлено"
+            )
+
+            if email_error:
+
+                result_lines.extend([
+                    "",
+                    "⚠️ Причина:",
+                    f"<code>{escape(email_error[:500])}</code>"
+                ])
+
+        result_lines.extend([
+            "",
+            "💾 Код сохранён в базе данных."
+        ])
+
+        if not email_sent:
+
+            result_lines.extend([
+                "",
+                "📋 <b>Резервный текст письма:</b>",
+                "<code>",
+                escape(
+                    f"""💗 КРУТЯШКИ
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎉 ВАША ЗАЯВКА ОДОБРЕНА!
+
+Здравствуйте, {nickname}!
+
+Поздравляем! Ваша заявка на вступление
+в клан «Крутяшки» была успешно одобрена.
+
+👤 ВАШ MINECRAFT НИК
+{nickname}
+
+🔐 ВАШ УНИКАЛЬНЫЙ КОД
+━━━━━━━━━━━━━━━━━━━━━━━━
+        {join_code}
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+⚠️ Обязательно сохраните этот код.
+
+💬 СООБЩЕНИЕ АДМИНИСТРАЦИИ
+
+{decision_message}
+
+📢 ОФИЦИАЛЬНЫЙ КАНАЛ
+{OFFICIAL_CHANNEL}
+
+🤖 ОФИЦИАЛЬНЫЙ БОТ
+{OFFICIAL_BOT}
+
+💗 Добро пожаловать в «Крутяшки»!"""
+                ),
+                "</code>"
+            ])
+
+        await message.answer(
+            "\n".join(result_lines)
+        )
+
+    # =====================================================
+    # ОТКЛОНЕНИЕ
+    # =====================================================
 
     else:
+
+        conn = get_db()
+        cur = conn.cursor()
+
+        now = datetime.now().isoformat()
 
         cur.execute("""
             UPDATE applications
@@ -2317,6 +2931,7 @@ async def admin_decision_process(
                 decided_at = ?,
                 decision_message = ?
             WHERE id = ?
+              AND status = 'pending'
         """, (
             "rejected",
             now,
@@ -2324,99 +2939,45 @@ async def admin_decision_process(
             app_id
         ))
 
-    cur.execute("""
-        SELECT
-            nickname,
-            email,
-            reason,
-            loyal,
-            pvp,
-            pve,
-            age,
-            username
-        FROM applications
-        WHERE id = ?
-    """, (app_id,))
+        changed = cur.rowcount
 
-    application = cur.fetchone()
+        conn.commit()
+        conn.close()
 
-    conn.commit()
-    conn.close()
+        await state.clear()
 
-    await state.clear()
+        if changed != 1:
 
-    if decision == "accepted":
-
-        user_text = (
-            "🎉 <b>Твоя заявка принята!</b>\n\n"
-            f"{escape(decision_message)}\n\n"
-            "💗 Добро пожаловать в клан <b>Крутяшки</b>!\n\n"
-            "🔑 Твой код вступления:\n"
-            f"<code>{join_code}</code>\n\n"
-            "Сохрани этот код."
-        )
-
-        try:
-            await bot.send_message(
-                user_id,
-                user_text
+            await message.answer(
+                "❌ Заявка уже была обработана."
             )
 
-        except Exception as e:
-            logger.error(
-                "Не удалось уведомить пользователя: %s",
-                e
-            )
-
-        (
-            nickname,
-            email,
-            reason,
-            loyal,
-            pvp,
-            pve,
-            age,
-            username
-        ) = application
-
-        email_text = (
-            "📧 <b>Готовый текст для отправки на Gmail</b>\n\n"
-            f"Кому: <code>{escape(email or '')}</code>\n\n"
-            "Текст:\n"
-            "<code>"
-            "Здравствуйте! Вы были приняты в клан «Крутяшки».\n\n"
-            f"Ваш Minecraft ник: {escape(nickname)}\n"
-            f"Код вступления: {join_code}\n\n"
-            "Сохраните этот код."
-            "</code>"
-        )
-
-        await message.answer(
-            "✅ <b>Заявка принята.</b>\n\n"
-            f"Пользователь: <code>{user_id}</code>\n"
-            f"Код: <code>{join_code}</code>\n\n"
-            f"{email_text}"
-        )
-
-    else:
+            return
 
         try:
+
             await bot.send_message(
                 user_id,
+                "💗 <b>КРУТЯШКИ</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
                 "❌ <b>Заявка отклонена.</b>\n\n"
-                f"{escape(decision_message)}\n\n"
-                "Повторно подать заявку можно через "
-                f"<b>{REAPPLY_COOLDOWN_HOURS} часа</b>."
+                "💬 <b>Сообщение администрации:</b>\n"
+                f"<i>{escape(decision_message)}</i>\n\n"
+                "⏳ Повторно подать заявку можно через "
+                f"<b>{REAPPLY_COOLDOWN_HOURS} часа</b>.\n\n"
+                "💗 Спасибо за интерес к нашему клану!"
             )
 
         except Exception as e:
+
             logger.error(
                 "Не удалось уведомить пользователя: %s",
                 e
             )
 
         await message.answer(
-            f"❌ Заявка <code>#{app_id}</code> отклонена."
+            "❌ <b>Заявка отклонена.</b>\n\n"
+            f"🆔 Заявка: <code>#{app_id}</code>"
         )
 
 
@@ -2429,10 +2990,12 @@ async def cancel_handler(
     message: Message,
     state: FSMContext
 ):
+
     await state.clear()
 
     await message.answer(
-        "❌ Текущее действие отменено."
+        "↩️ <b>Текущее действие отменено.</b>\n\n"
+        "Можешь начать заново."
     )
 
 
@@ -2444,14 +3007,16 @@ async def cancel_handler(
 async def blocked_handler(
     message: Message
 ):
+
     if message.from_user.id == ADMIN_ID:
         return
 
     save_user(message)
 
     if is_blocked(message.from_user.id):
+
         await message.answer(
-            "🚫 <b>Доступ ограничен.</b>\n\n"
+            "🚫 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
             "Вы не можете использовать этого бота."
         )
 
@@ -2461,6 +3026,7 @@ async def blocked_handler(
 # =========================================================
 
 async def main():
+
     init_db()
 
     me = await bot.get_me()
@@ -2493,6 +3059,10 @@ async def main():
 
     await dp.start_polling(bot)
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     asyncio.run(main())
