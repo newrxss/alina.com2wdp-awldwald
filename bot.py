@@ -810,6 +810,25 @@ def rating_keyboard(prefix: str):
     )
 
 
+def email_control_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Поменять почту",
+                    callback_data="email_change"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отменить заявку",
+                    callback_data="application_cancel"
+                )
+            ]
+        ]
+    )
+
+
 def admin_application_keyboard(app_id: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1459,8 +1478,82 @@ async def age_handler(
         "📩 Например:\n"
         "<code>example@gmail.com</code>\n\n"
         "🔒 Твой адрес используется только для "
-        "связи по заявке."
+        "связи по заявке.",
+        reply_markup=email_control_keyboard()
     )
+
+
+# =========================================================
+# EMAIL CONTROLS
+# =========================================================
+
+@dp.callback_query(
+    ApplicationForm.email,
+    F.data == "email_change"
+)
+async def email_change_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.set_state(ApplicationForm.email)
+
+    await callback.message.answer(
+        "🔄 <b>ПОМЕНЯТЬ ПОЧТУ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Введи новый Gmail.\n\n"
+        "📩 Например:\n"
+        "<code>example@gmail.com</code>",
+        reply_markup=email_control_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    ApplicationForm.email_code,
+    F.data == "email_change"
+)
+async def email_change_from_code_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.set_state(ApplicationForm.email)
+    await state.update_data(
+        verification_code=None,
+        verification_created_at=None,
+        verification_email=None
+    )
+
+    await callback.message.answer(
+        "🔄 <b>ПОМЕНЯТЬ ПОЧТУ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Хорошо. Введи новый Gmail.\n\n"
+        "📩 Например:\n"
+        "<code>example@gmail.com</code>",
+        reply_markup=email_control_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(
+    F.data == "application_cancel"
+)
+async def application_cancel_handler(
+    callback: CallbackQuery,
+    state: FSMContext
+):
+    await state.clear()
+
+    await callback.message.answer(
+        "❌ <b>ЗАЯВКА ОТМЕНЕНА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Текущая анкета отменена.\n\n"
+        "Никаких данных этой незавершённой анкеты "
+        "в базу не сохранено.\n\n"
+        "Если захочешь, можешь начать заново через "
+        "кнопку «Вступить в клан»."
+    )
+    await callback.answer("Заявка отменена")
+
 
 
 # =========================================================
@@ -1484,8 +1577,10 @@ async def email_handler(
 
         await message.answer(
             "❌ <b>Нужен именно адрес Gmail.</b>\n\n"
+            "Проверь адрес и введи его ещё раз.\n\n"
             "Например:\n"
-            "<code>example@gmail.com</code>"
+            "<code>example@gmail.com</code>",
+            reply_markup=email_control_keyboard()
         )
 
         return
@@ -1582,7 +1677,8 @@ async def email_handler(
             f"<code>{escape(email)}</code>\n\n"
             "🔢 Введи 6-значный код из письма сюда.\n\n"
             f"⏱ Код действует "
-            f"{EMAIL_CODE_EXPIRE_MINUTES} минут."
+            f"{EMAIL_CODE_EXPIRE_MINUTES} минут.",
+            reply_markup=email_control_keyboard()
         )
 
     except Exception:
@@ -1591,7 +1687,8 @@ async def email_handler(
             "📨 <b>Код отправлен!</b>\n\n"
             "Введи код из письма.\n\n"
             f"⏱ Код действует "
-            f"{EMAIL_CODE_EXPIRE_MINUTES} минут."
+            f"{EMAIL_CODE_EXPIRE_MINUTES} минут.",
+            reply_markup=email_control_keyboard()
         )
 
 
@@ -1675,8 +1772,8 @@ async def email_code_handler(
 
         await message.answer(
             "⌛ <b>КОД ИСТЁК</b>\n\n"
-            "Начни заявку заново, чтобы получить "
-            "новый код."
+            "Можно поменять почту или отменить текущую заявку.",
+            reply_markup=email_control_keyboard()
         )
 
         return
@@ -2954,8 +3051,9 @@ async def admin_decision_process(
 
             return
 
-        try:
+        telegram_sent = False
 
+        try:
             await bot.send_message(
                 user_id,
                 "💗 <b>КРУТЯШКИ</b>\n"
@@ -2965,20 +3063,133 @@ async def admin_decision_process(
                 f"<i>{escape(decision_message)}</i>\n\n"
                 "⏳ Повторно подать заявку можно через "
                 f"<b>{REAPPLY_COOLDOWN_HOURS} часа</b>.\n\n"
+                "📧 Подробная информация отправлена на "
+                "подтверждённый Gmail.\n\n"
                 "💗 Спасибо за интерес к нашему клану!"
             )
-
+            telegram_sent = True
         except Exception as e:
-
             logger.error(
                 "Не удалось уведомить пользователя: %s",
                 e
             )
 
-        await message.answer(
-            "❌ <b>Заявка отклонена.</b>\n\n"
-            f"🆔 Заявка: <code>#{app_id}</code>"
+        # Отправляем решение также на Gmail, который пользователь
+        # подтвердил во время подачи заявки.
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT email, nickname FROM applications WHERE id = ?",
+            (app_id,)
         )
+        email_row = cur.fetchone()
+        conn.close()
+
+        rejection_email_sent = False
+        rejection_email_error = None
+
+        if email_row and email_row[0]:
+            try:
+                await send_rejection_email(
+                    email=email_row[0],
+                    nickname=email_row[1] or data.get("nickname", "игрок"),
+                    decision_message=decision_message
+                )
+                rejection_email_sent = True
+            except Exception as e:
+                rejection_email_error = str(e)
+                logger.exception(
+                    "Не удалось отправить письмо об отказе по заявке #%s: %s",
+                    app_id,
+                    e
+                )
+
+        result = (
+            "❌ <b>ЗАЯВКА ОТКЛОНЕНА</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Заявка: <code>#{app_id}</code>\n"
+            f"📱 Telegram: {'✅ отправлено' if telegram_sent else '❌ не отправлено'}\n"
+            f"📧 Gmail: {'✅ письмо отправлено' if rejection_email_sent else '❌ письмо не отправлено'}"
+        )
+
+        if email_row and email_row[0]:
+            result += f"\n📨 Адрес: <code>{escape(email_row[0])}</code>"
+
+        if rejection_email_error:
+            result += (
+                "\n\n⚠️ Причина ошибки Gmail:\n"
+                f"<code>{escape(rejection_email_error[:500])}</code>"
+            )
+
+        await message.answer(result)
+
+
+
+# =========================================================
+# EMAIL REJECTION
+# =========================================================
+
+async def send_rejection_email(
+    email: str,
+    nickname: str,
+    decision_message: str
+):
+    text_content = f"""💗 КРУТЯШКИ
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ ВАША ЗАЯВКА ОТКЛОНЕНА
+
+Здравствуйте, {nickname}!
+
+Спасибо за интерес к клану «Крутяшки» и за
+то, что прошли нашу анкету.
+
+К сожалению, на данный момент ваша заявка
+на вступление в клан была отклонена.
+
+💬 СООБЩЕНИЕ АДМИНИСТРАЦИИ
+
+{decision_message}
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔄 ПОВТОРНАЯ ПОДАЧА
+
+Не расстраивайтесь. Через {REAPPLY_COOLDOWN_HOURS} часа
+вы сможете снова подать заявку и заполнить
+анкету ещё раз. Пожалуйста, внимательно
+проверьте все данные перед отправкой.
+
+📞 КОНТАКТЫ
+
+👑 Создатель:
+{ALINA_USERNAME}
+
+🤖 Официальный бот:
+{OFFICIAL_BOT}
+
+📢 Официальный канал:
+{OFFICIAL_CHANNEL}
+
+Если у вас остались вопросы или вы считаете,
+что произошла ошибка, обратитесь к администрации.
+
+💗 Спасибо за интерес к «Крутяшкам».
+
+С уважением,
+администрация клана «Крутяшки»
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+Это автоматическое сообщение
+официального бота «Крутяшки».
+"""
+
+    return await send_brevo_email(
+        email,
+        "💗 Крутяшки — решение по вашей заявке",
+        text_content
+    )
+
 
 
 # =========================================================
